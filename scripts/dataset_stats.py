@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--splits", nargs="+", default=list(SPLIT_FILES), choices=list(SPLIT_FILES)
     )
-    parser.add_argument("--target-max-length", type=int, default=128)
+    parser.add_argument("--target-max-length", type=int, default=640)
     parser.add_argument("--prefix", default=DEFAULT_PREFIX)
     parser.add_argument(
         "--max-rows",

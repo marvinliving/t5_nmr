@@ -141,7 +141,7 @@ class TrainConfig:
                 env_str("TOKENIZED_CACHE_DIR", str(output_dir / "tokenized"))
             ),
             prefix=env_str("PREFIX", DEFAULT_PREFIX),
-            target_max_length=env_int("TARGET_MAX_LENGTH", 128),
+            target_max_length=env_int("TARGET_MAX_LENGTH", 640),
             seed=env_int("SEED", 42),
             learning_rate=env_float("LEARNING_RATE", 5e-5),
             lr_scaling=lr_scaling,
@@ -174,7 +174,7 @@ class TrainConfig:
             stop_margin_minutes=env_float("STOP_MARGIN_MINUTES", 20),
             test_sample_size=env_int("TEST_SAMPLE_SIZE", 1000),
             generation_batch_size=env_int("GENERATION_BATCH_SIZE", 32),
-            generation_max_new_tokens=env_int("GENERATION_MAX_NEW_TOKENS", 128),
+            generation_max_new_tokens=env_int("GENERATION_MAX_NEW_TOKENS", 640),
             parallel_mode=parallel_mode,
             gpus_per_node=env_int("GPUS_PER_NODE", 1),
             world_size=world_size,

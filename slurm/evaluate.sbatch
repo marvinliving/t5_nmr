@@ -50,7 +50,7 @@ python evaluate_exact_match.py \
   --split "$EVAL_SPLIT" \
   --num-outputs "$NUM_OUTPUTS" \
   --batch-size "${EVAL_GENERATION_BATCH_SIZE:-16}" \
-  --max-new-tokens "${GENERATION_MAX_NEW_TOKENS:-128}" \
+  --max-new-tokens "${GENERATION_MAX_NEW_TOKENS:-640}" \
   --start-index "$START_INDEX" \
   --sample-size "$CHUNK_SIZE" \
   --resume \

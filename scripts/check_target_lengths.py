@@ -35,14 +35,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-max-length",
         type=int,
-        default=int(os.environ.get("TARGET_MAX_LENGTH", 128)),
-        help="Training label limit, with end-of-sequence (default 128)",
+        default=int(os.environ.get("TARGET_MAX_LENGTH", 640)),
+        help="Training label limit, with end-of-sequence (default 640)",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=int(os.environ.get("GENERATION_MAX_NEW_TOKENS", 128)),
-        help="Generation limit (default 128)",
+        default=int(os.environ.get("GENERATION_MAX_NEW_TOKENS", 640)),
+        help="Generation limit (default 640)",
     )
     parser.add_argument(
         "--show", type=int, default=20, help="Rows over a limit to print per split"

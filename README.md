@@ -186,7 +186,7 @@ A config sets any of these. Variables that a config doesn't set can also be give
 | `WARMUP_RATIO` | 0 | Share of training spent raising the learning rate from 0, for example 0.03 |
 | `WEIGHT_DECAY` | 0.01 | Optimizer weight decay |
 | `GRADIENT_CHECKPOINTING` | 0 | 1 trades speed for lower GPU memory |
-| `TARGET_MAX_LENGTH` | 128 | SMILES strings longer than this many tokens are cut off |
+| `TARGET_MAX_LENGTH` | 640 | SMILES strings longer than this many tokens are cut off |
 | `EVAL_BATCH_SIZE` | 4 × `PER_GPU_BATCH` | Batch size for validation loss |
 | `EVAL_MAX_SAMPLES` | 5000 | Validation molecules (the first ones) used for validation loss; 0 uses all 35,749 |
 | `GROUP_BY_LENGTH` | 0 | 1 batches spectra of similar length together (see [Performance](#performance-and-comparability)) |
@@ -195,7 +195,7 @@ A config sets any of these. Variables that a config doesn't set can also be give
 | `STOP_MARGIN_MINUTES` | 20 | Save and stop this long before the job's time limit |
 | `TEST_SAMPLE_SIZE` | 1000 | Test molecules in the quick end-of-training check |
 | `GENERATION_BATCH_SIZE` | 32 | Batch size for the quick check |
-| `GENERATION_MAX_NEW_TOKENS` | 128 | Longest SMILES the quick check and the evaluation can generate |
+| `GENERATION_MAX_NEW_TOKENS` | 640 | Longest SMILES the quick check and the evaluation can generate |
 | `SEED` | 42 | Random seed |
 | `LOCAL_FILES_ONLY` | 0 | Set to 1 on offline nodes after the model is downloaded once |
 | `PARALLEL_MODE` | `none`, or `ddp` on several GPUs | `none`, `ddp`, `fsdp` or `hsdp`; see [Which mode to use](#which-mode-to-use) |

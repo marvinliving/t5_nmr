@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         choices=("validation", "test"),
         default="test",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--max-new-tokens", type=int, default=640)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
         "--start-index",
@@ -196,7 +196,7 @@ def run_evaluation(
     prefix: str = DEFAULT_PREFIX,
     batch_size: int = 16,
     num_outputs: int = 1,
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 640,
     sort_by_length: bool = True,
     window_batches: int = 100,
     predictions_handle: Optional[TextIO] = None,
