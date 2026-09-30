@@ -29,19 +29,31 @@ from evaluate_exact_match import run_evaluation
 from nmr_data import load_split, load_tokenized_splits
 
 
-def untie_output_layer(model: torch.nn.Module) -> None:
-    """Keep FLAN-T5's output layer separate from its input embeddings.
+def fix_t5_embeddings(model: torch.nn.Module) -> None:
+    """Give every rank FLAN-T5's real embedding structure, which FSDP needs.
 
-    transformers 5.12 always tells T5 to tie lm_head to the shared input
-    embeddings, and only skips it at load time when the checkpoint holds two
-    different tensors. Under FSDP with cpu_ram_efficient_loading, ranks other
-    than local rank 0 load all-zero weights, so the check passes and those
-    ranks tie lm_head while rank 0 does not; the ranks then hold different
-    parameter sets and saving the optimizer state fails. FSDP preparation
-    also calls tie_weights() again. Removing lm_head from the tie mapping,
-    rather than setting tie_word_embeddings=False (which would also untie
-    the encoder and decoder input embeddings), gives every rank flan-t5's
-    real structure. Other ranks' values are replaced by rank 0's broadcast.
+    FLAN-T5 has one input embedding (model.shared) used by the encoder and
+    the decoder, and a separate output layer (lm_head). transformers 5.12
+    gets both wrong for FSDP:
+
+    - It always tells T5 to tie lm_head to the input embeddings, and only
+      skips it at load time when the checkpoint holds two different tensors.
+      Under FSDP with cpu_ram_efficient_loading, ranks other than local rank
+      0 load all-zero weights, so the check passes and those ranks tie
+      lm_head while rank 0 does not. The ranks then hold different parameter
+      sets and saving the optimizer state fails. FSDP preparation also calls
+      tie_weights() again. Removing lm_head from the tie mapping fixes both;
+      setting tie_word_embeddings=False instead would also untie the encoder
+      and decoder input embeddings.
+    - The encoder and decoder each get their own embedding module that shares
+      model.shared's weight. accelerate shards model.shared as its own FSDP
+      group and the other two modules land in the root group, so the first
+      forward fails with "Parameter 'shared.weight' is shared with a
+      parameter already managed by another FSDP group". Pointing both at
+      model.shared itself, as transformers 4.x did, leaves one owner.
+
+    Neither change alters the computation. Other ranks' lm_head values are
+    replaced by rank 0's broadcast.
     """
     model._tied_weights_keys = {
         target: source
@@ -51,6 +63,7 @@ def untie_output_layer(model: torch.nn.Module) -> None:
     model.all_tied_weights_keys.pop("lm_head.weight", None)
     if model.lm_head.weight is model.shared.weight:
         model.lm_head.weight = torch.nn.Parameter(model.shared.weight.detach().clone())
+    model.set_input_embeddings(model.shared)
 
 
 class StopBeforeTimeLimit(TrainerCallback):
@@ -299,7 +312,7 @@ def main() -> None:
         config.model_name,
         local_files_only=config.local_files_only,
     )
-    untie_output_layer(model)
+    fix_t5_embeddings(model)
     data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         model=model,

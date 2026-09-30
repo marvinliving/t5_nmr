@@ -1,4 +1,4 @@
-"""Fast tests of the evaluation bookkeeping; no model is loaded."""
+"""Fast tests of the evaluation bookkeeping and training setup; only tiny models are built."""
 
 import json
 import sys
@@ -149,3 +149,80 @@ def test_resume_refused_with_different_gpu_count(monkeypatch, tmp_path):
     )
     with pytest.raises(SystemExit):
         check_resume_compatible(fewer, str(tmp_path / "checkpoint-10"))
+
+
+@pytest.fixture
+def tiny_flan_t5(tmp_path):
+    """A tiny checkpoint shaped like FLAN-T5: output layer separate from the input embeddings."""
+    import torch
+    from transformers import T5Config, T5ForConditionalGeneration
+
+    torch.manual_seed(0)
+    config = T5Config(
+        vocab_size=64, d_model=16, d_ff=32, d_kv=8, num_heads=2, num_layers=1,
+        feed_forward_proj="gated-gelu", tie_word_embeddings=False,
+        pad_token_id=0, eos_token_id=1, decoder_start_token_id=0,
+    )
+    model = T5ForConditionalGeneration(config)
+    model.lm_head.weight = torch.nn.Parameter(torch.randn_like(model.shared.weight))
+    model.save_pretrained(tmp_path)
+    return tmp_path
+
+
+def load_tiny(path, zero_weights=False):
+    import torch
+    from transformers import AutoModelForSeq2SeqLM
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(path)
+    if zero_weights:
+        # What ranks other than local rank 0 see under FSDP with
+        # cpu_ram_efficient_loading: all-zero weights, then the load-time tie.
+        with torch.no_grad():
+            for param in model.parameters():
+                param.zero_()
+        model.all_tied_weights_keys = model.get_expanded_tied_weights_keys(all_submodels=True)
+        model.tie_weights(missing_keys=set(), recompute_mapping=False)
+    return model
+
+
+@pytest.mark.parametrize("zero_weights", [False, True], ids=["rank0", "other_ranks"])
+def test_t5_embeddings_survive_fsdp_preparation(tiny_flan_t5, zero_weights):
+    import torch
+
+    from t5_train import fix_t5_embeddings
+
+    reference = load_tiny(tiny_flan_t5)
+    expected_names = sorted(name for name, _ in reference.named_parameters())
+    assert "lm_head.weight" in expected_names
+
+    model = load_tiny(tiny_flan_t5, zero_weights)
+    fix_t5_embeddings(model)
+    # accelerate's fsdp2_prepare_model moves the model to meta and re-ties.
+    model = model.to(torch.device("meta"))
+    model.tie_weights()
+
+    assert sorted(name for name, _ in model.named_parameters()) == expected_names
+    assert model.lm_head.weight is not model.shared.weight
+    # One module owns the input embedding, so FSDP2 puts it in one group.
+    assert model.encoder.embed_tokens is model.shared
+    assert model.decoder.embed_tokens is model.shared
+
+
+def test_t5_embedding_fix_keeps_outputs_and_checkpoint(tiny_flan_t5, tmp_path):
+    import torch
+    from transformers import AutoModelForSeq2SeqLM
+
+    from t5_train import fix_t5_embeddings
+
+    inputs = {"input_ids": torch.tensor([[5, 6, 7, 1]]), "labels": torch.tensor([[8, 9, 1]])}
+    reference = load_tiny(tiny_flan_t5).eval()
+    model = load_tiny(tiny_flan_t5).eval()
+    fix_t5_embeddings(model)
+    with torch.no_grad():
+        assert torch.equal(model(**inputs).logits, reference(**inputs).logits)
+
+    model.save_pretrained(tmp_path / "saved")
+    reloaded = AutoModelForSeq2SeqLM.from_pretrained(tmp_path / "saved").eval()
+    assert torch.equal(reloaded.lm_head.weight, reference.lm_head.weight)
+    with torch.no_grad():
+        assert torch.equal(reloaded(**inputs).logits, reference(**inputs).logits)
