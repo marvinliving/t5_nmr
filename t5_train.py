@@ -29,6 +29,30 @@ from evaluate_exact_match import run_evaluation
 from nmr_data import load_split, load_tokenized_splits
 
 
+def untie_output_layer(model: torch.nn.Module) -> None:
+    """Keep FLAN-T5's output layer separate from its input embeddings.
+
+    transformers 5.12 always tells T5 to tie lm_head to the shared input
+    embeddings, and only skips it at load time when the checkpoint holds two
+    different tensors. Under FSDP with cpu_ram_efficient_loading, ranks other
+    than local rank 0 load all-zero weights, so the check passes and those
+    ranks tie lm_head while rank 0 does not; the ranks then hold different
+    parameter sets and saving the optimizer state fails. FSDP preparation
+    also calls tie_weights() again. Removing lm_head from the tie mapping,
+    rather than setting tie_word_embeddings=False (which would also untie
+    the encoder and decoder input embeddings), gives every rank flan-t5's
+    real structure. Other ranks' values are replaced by rank 0's broadcast.
+    """
+    model._tied_weights_keys = {
+        target: source
+        for target, source in model._tied_weights_keys.items()
+        if target != "lm_head.weight"
+    }
+    model.all_tied_weights_keys.pop("lm_head.weight", None)
+    if model.lm_head.weight is model.shared.weight:
+        model.lm_head.weight = torch.nn.Parameter(model.shared.weight.detach().clone())
+
+
 class StopBeforeTimeLimit(TrainerCallback):
     """Save a checkpoint and stop cleanly before Slurm kills the job.
 
@@ -275,13 +299,7 @@ def main() -> None:
         config.model_name,
         local_files_only=config.local_files_only,
     )
-    # FLAN-T5 has an output layer separate from its input embeddings, and its
-    # config.json says so, but transformers 5.12 loads tie_word_embeddings as
-    # True. The weights load untied; FSDP's preparation then calls
-    # tie_weights(), which would replace lm_head with the input embeddings,
-    # and accelerate stops with "FSDP2 mapping failed (missing:
-    # ['lm_head.weight'])".
-    model.config.tie_word_embeddings = False
+    untie_output_layer(model)
     data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         model=model,
