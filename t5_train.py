@@ -275,6 +275,13 @@ def main() -> None:
         config.model_name,
         local_files_only=config.local_files_only,
     )
+    # FLAN-T5 has an output layer separate from its input embeddings, and its
+    # config.json says so, but transformers 5.12 loads tie_word_embeddings as
+    # True. The weights load untied; FSDP's preparation then calls
+    # tie_weights(), which would replace lm_head with the input embeddings,
+    # and accelerate stops with "FSDP2 mapping failed (missing:
+    # ['lm_head.weight'])".
+    model.config.tie_word_embeddings = False
     data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         model=model,
