@@ -6,6 +6,7 @@ starts one process per GPU with srun and sets RANK, LOCAL_RANK and WORLD_SIZE;
 PARALLEL_MODE chooses ddp, fsdp or hsdp.
 """
 
+import gc
 import json
 import os
 import signal
@@ -385,7 +386,11 @@ def main() -> None:
         # A DDP- or FSDP-wrapped model cannot generate on one rank, so rank 0
         # reloads the saved model in bf16, as evaluate_exact_match.py does.
         torch.distributed.barrier()
-        del trainer, model
+        # The collator also holds the model, and the trainer's reference
+        # cycles keep the optimizer state alive until a collection, so free
+        # all of it before loading a second copy of the model.
+        del trainer, model, data_collator
+        gc.collect()
         torch.cuda.empty_cache()
         torch.distributed.destroy_process_group()
         if not config.is_main_process:
