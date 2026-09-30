@@ -209,7 +209,7 @@ def build_training_args(config: TrainConfig, use_bf16: bool) -> Seq2SeqTrainingA
     return Seq2SeqTrainingArguments(
         output_dir=str(config.output_dir),
         eval_strategy="epoch",
-        save_strategy="steps",
+        save_strategy=config.save_strategy,
         save_steps=config.save_steps,
         save_total_limit=config.save_total_limit,
         logging_strategy="steps",

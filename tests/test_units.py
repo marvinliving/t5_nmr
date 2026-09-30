@@ -226,3 +226,10 @@ def test_t5_embedding_fix_keeps_outputs_and_checkpoint(tiny_flan_t5, tmp_path):
     assert torch.equal(reloaded.lm_head.weight, reference.lm_head.weight)
     with torch.no_grad():
         assert torch.equal(reloaded(**inputs).logits, reference(**inputs).logits)
+
+
+def test_save_strategy_read_and_checked(monkeypatch):
+    assert make_config(monkeypatch).save_strategy == "steps"
+    assert make_config(monkeypatch, SAVE_STRATEGY="Epoch").save_strategy == "epoch"
+    with pytest.raises(ValueError, match="SAVE_STRATEGY"):
+        make_config(monkeypatch, SAVE_STRATEGY="best")

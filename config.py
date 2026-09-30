@@ -18,6 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 PARALLEL_MODES = ("none", "ddp", "fsdp", "hsdp")
 LR_SCALINGS = ("none", "sqrt", "linear")
+SAVE_STRATEGIES = ("steps", "epoch")
 
 
 def env_str(name: str, default: str) -> str:
@@ -71,6 +72,7 @@ class TrainConfig:
     group_by_length: bool
 
     # ===== Checkpointing and job time limit =====
+    save_strategy: str
     save_steps: int
     save_total_limit: int
     job_end_time: float
@@ -133,6 +135,13 @@ class TrainConfig:
                 f"LR_SCALING must be one of {LR_SCALINGS}, got {lr_scaling!r}"
             )
 
+        # steps: every SAVE_STEPS updates. epoch: at the end of every epoch.
+        save_strategy = env_str("SAVE_STRATEGY", "steps").strip().lower()
+        if save_strategy not in SAVE_STRATEGIES:
+            raise ValueError(
+                f"SAVE_STRATEGY must be one of {SAVE_STRATEGIES}, got {save_strategy!r}"
+            )
+
         return cls(
             model_name=model_name,
             data_dir=Path(env_str("DATA_DIR", str(BASE_DIR / "alberts_2d"))),
@@ -167,6 +176,7 @@ class TrainConfig:
             # Changes the order samples are drawn in, so off by default until
             # validated against a run without it.
             group_by_length=env_bool("GROUP_BY_LENGTH", False),
+            save_strategy=save_strategy,
             save_steps=env_int("SAVE_STEPS", 2000),
             save_total_limit=env_int("SAVE_TOTAL_LIMIT", 2),
             # Unix time the Slurm job is killed at; 0 means no limit.

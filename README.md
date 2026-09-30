@@ -139,7 +139,7 @@ Run names are `<model>_<batch>x<accumulation>[x<gpus>]_<epochs>ep`. For example,
 | base | 250M | `base_16x1_3ep`, `base_scaling_gb16` | | `base_scaling_gb128_sqrt`, `base_scaling_gb128_linear` |
 | large | 780M | `large_4x4_3ep`, `large_4x4_10ep` | `large_4x1x4_10ep` | |
 | xl | 3B | `xl_4x4_3ep`, `xl_1x16_3ep`, `xl_4x4_10ep`, `xl_1x16_10ep`, `xl_2x8_10ep` | `xl_4x1x4_10ep` | `xl_pg4_10ep` |
-| xxl | 11B | (can't fit, see [Multi-GPU training](#multi-gpu-training)) | `xxl_2x2x4_10ep`, `xxl_1x4x4_10ep` | `xxl_2x1x8_10ep`, `xxl_pg2_10ep` |
+| xxl | 11B | (can't fit, see [Multi-GPU training](#multi-gpu-training)) | `xxl_4x1x4_10ep`, `xxl_2x2x4_10ep`, `xxl_1x4x4_10ep` | `xxl_2x1x8_10ep`, `xxl_pg2_10ep` |
 
 The runs in the first two GPU columns update the model with 16 examples at a time: batch per GPU × accumulation steps × number of GPUs = 16. This keeps them comparable with the 88.2% XL result. Runs with a smaller batch per step, such as 1×16, use less GPU memory but train more slowly. The multi-node runs use larger global batches with a scaled learning rate, which is a different recipe; see [Multi-node training](#multi-node-training).
 
@@ -192,6 +192,7 @@ A config sets any of these. Variables that a config doesn't set can also be give
 | `GROUP_BY_LENGTH` | 0 | 1 batches spectra of similar length together (see [Performance](#performance-and-comparability)) |
 | `DATALOADER_NUM_WORKERS` | 4 on 1 GPU, 8 on several | Worker processes per GPU that prepare batches; also used to tokenize the data |
 | `SAVE_STEPS` / `SAVE_TOTAL_LIMIT` | 2000 / 2 | Checkpoint frequency and how many to keep |
+| `SAVE_STRATEGY` | steps | `epoch` saves at the end of every epoch instead of every `SAVE_STEPS` updates |
 | `STOP_MARGIN_MINUTES` | 20 | Save and stop this long before the job's time limit |
 | `TEST_SAMPLE_SIZE` | 1000 | Test molecules in the quick end-of-training check |
 | `GENERATION_BATCH_SIZE` | 32 | Batch size for the quick check |
