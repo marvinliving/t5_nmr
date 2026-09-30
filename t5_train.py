@@ -99,6 +99,15 @@ class StopBeforeTimeLimit(TrainerCallback):
             control.should_save = True
             control.should_training_stop = True
 
+    def on_epoch_end(self, args, state, control, **kwargs):
+        # After a stop the Trainer still ends the epoch it broke out of. With
+        # per-epoch eval or saving, that would validate and write the
+        # checkpoint just saved a second time, eating into the stop margin;
+        # if Slurm killed the job mid-write, the checkpoint would be lost.
+        if self.stopped:
+            control.should_evaluate = False
+            control.should_save = False
+
 
 def save_metrics_file(output_dir: Path, split: str, metrics: dict) -> None:
     """Write <split>_results.json and all_results.json like Trainer.save_metrics."""

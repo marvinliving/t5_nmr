@@ -233,3 +233,22 @@ def test_save_strategy_read_and_checked(monkeypatch):
     assert make_config(monkeypatch, SAVE_STRATEGY="Epoch").save_strategy == "epoch"
     with pytest.raises(ValueError, match="SAVE_STRATEGY"):
         make_config(monkeypatch, SAVE_STRATEGY="best")
+
+
+def test_stop_skips_the_epoch_end_eval_and_save():
+    import torch
+    from transformers import TrainerControl, TrainerState, TrainingArguments
+    from transformers.trainer_callback import DefaultFlowCallback
+
+    from t5_train import StopBeforeTimeLimit
+
+    args = TrainingArguments(output_dir="unused", eval_strategy="epoch", save_strategy="epoch")
+    state = TrainerState(global_step=10, epoch=0.5)
+    stopper = StopBeforeTimeLimit(deadline=1, device=torch.device("cpu"), check_every=10)
+    stopper.on_step_end(args, state, TrainerControl())
+    assert stopper.stopped
+
+    # The Trainer runs DefaultFlowCallback before the stopper.
+    control = DefaultFlowCallback().on_epoch_end(args, state, TrainerControl())
+    stopper.on_epoch_end(args, state, control)
+    assert not control.should_evaluate and not control.should_save
