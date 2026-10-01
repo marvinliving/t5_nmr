@@ -252,3 +252,143 @@ def test_stop_skips_the_epoch_end_eval_and_save():
     control = DefaultFlowCallback().on_epoch_end(args, state, TrainerControl())
     stopper.on_epoch_end(args, state, control)
     assert not control.should_evaluate and not control.should_save
+
+
+def fsdp_checkpoint_worker(rank, model_dir, checkpoint_dir, port):
+    """Train one step under FSDP2 and save the model as accelerate does for SHARDED_STATE_DICT."""
+    import os
+
+    import torch
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    from t5_train import fix_t5_embeddings
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    torch.distributed.init_process_group("gloo", rank=rank, world_size=2)
+    model = load_tiny(model_dir)
+    fix_t5_embeddings(model)
+    mesh = init_device_mesh("cpu", (2,))
+    for block in model.encoder.block + model.decoder.block:
+        fully_shard(block, mesh=mesh)
+    fully_shard(model.shared, mesh=mesh)
+    fully_shard(model, mesh=mesh)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    batch = {"input_ids": torch.tensor([[5, 6, 7, 1]]), "labels": torch.tensor([[8, 9, 1]])}
+    model(**batch).loss.backward()
+    optimizer.step()
+
+    sharded = get_model_state_dict(model, options=StateDictOptions(full_state_dict=False))
+    dcp.save({"model": sharded}, storage_writer=dcp.FileSystemWriter(
+        str(Path(checkpoint_dir) / "pytorch_model_fsdp_0")
+    ))
+    full = get_model_state_dict(
+        model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+    )
+    if rank == 0:
+        torch.save(full, Path(checkpoint_dir) / "expected.pt")
+    torch.distributed.destroy_process_group()
+
+
+def test_fsdp_checkpoint_loads_into_one_model(tiny_flan_t5, tmp_path):
+    """Run on two CPU processes; takes about 15 seconds."""
+    import socket
+
+    import torch
+
+    from checkpoint_progress import load_model
+
+    checkpoint = tmp_path / "checkpoint-1"
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    torch.multiprocessing.spawn(
+        fsdp_checkpoint_worker, args=(tiny_flan_t5, checkpoint, port), nprocs=2
+    )
+    expected = torch.load(checkpoint / "expected.pt")
+    pretrained = load_tiny(tiny_flan_t5).state_dict()
+    # The training step changed the weights, so a match means they were loaded.
+    assert not torch.equal(expected["lm_head.weight"], pretrained["lm_head.weight"])
+
+    cpu = torch.device("cpu")
+    model = load_model(checkpoint, str(tiny_flan_t5), torch.float32, cpu, local_files_only=True)
+    state = model.state_dict()
+    for name, tensor in expected.items():
+        assert torch.equal(state[name], tensor), name
+    assert model.lm_head.weight is not model.shared.weight
+    assert model.encoder.embed_tokens.weight is model.shared.weight
+
+    # bf16, as on a GPU: the stored fp32 weights are converted.
+    model = load_model(checkpoint, str(tiny_flan_t5), torch.bfloat16, cpu, local_files_only=True)
+    assert model.lm_head.weight.dtype == torch.bfloat16
+    assert torch.equal(model.lm_head.weight, expected["lm_head.weight"].to(torch.bfloat16))
+
+
+def write_trainer_state(path: Path, step: int, epoch: float, eval_losses: dict) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    log = [{"step": s, "epoch": s / 10, "eval_loss": loss} for s, loss in eval_losses.items()]
+    (path / "trainer_state.json").write_text(
+        json.dumps({"global_step": step, "epoch": epoch, "log_history": log})
+    )
+
+
+def test_progress_finds_complete_checkpoints_in_step_order(tmp_path):
+    from checkpoint_progress import eval_losses, find_models, training_progress
+
+    losses = {10: 0.9, 20: 0.7, 30: 0.6}
+    write_trainer_state(tmp_path / "checkpoint-20", 20, 2.0, {10: 0.9, 20: 0.7})
+    write_trainer_state(tmp_path / "checkpoint-10", 10, 1.0, {10: 0.9})
+    # Still being saved: no trainer_state.json yet.
+    (tmp_path / "checkpoint-30").mkdir()
+    assert [path.name for path in find_models(tmp_path)] == ["checkpoint-10", "checkpoint-20"]
+    assert training_progress(tmp_path / "checkpoint-20", tmp_path, eval_losses(tmp_path)) == {
+        "epoch": 2.0, "step": 20, "eval_loss": 0.7,
+    }
+
+    # final_model is added when it is newer than the last checkpoint.
+    final_model = tmp_path / "final_model"
+    final_model.mkdir()
+    (final_model / "config.json").write_text("{}")
+    (final_model / "model.safetensors").write_text("")
+    write_trainer_state(tmp_path, 30, 3.0, losses)
+    assert [path.name for path in find_models(tmp_path)][-1] == "final_model"
+    assert training_progress(final_model, tmp_path, eval_losses(tmp_path))["eval_loss"] == 0.6
+
+    # With per-epoch saving the last checkpoint is the final model. Saved
+    # before the last evaluation, its own history lacks that loss.
+    write_trainer_state(tmp_path / "checkpoint-30", 30, 3.0, {10: 0.9, 20: 0.7})
+    assert [path.name for path in find_models(tmp_path)][-1] == "checkpoint-30"
+    progress = training_progress(tmp_path / "checkpoint-30", tmp_path, eval_losses(tmp_path))
+    assert progress["eval_loss"] == 0.6
+
+    # A checkpoint saved mid-epoch has no loss of its own.
+    write_trainer_state(tmp_path / "checkpoint-25", 25, 2.5, {10: 0.9, 20: 0.7})
+    assert training_progress(tmp_path / "checkpoint-25", tmp_path, {})["eval_loss"] is None
+
+
+@pytest.mark.parametrize(
+    "eval_data_dir, results_dir",
+    [
+        (None, "outputs/xl_4x1x4_10ep"),
+        ("/projects/b5an/alberts_2d", "outputs/xl_4x1x4_10ep"),
+        ("/projects/b5an/nmr_expt_data", "outputs/xl_4x1x4_10ep/eval_nmr_expt_data"),
+    ],
+)
+def test_results_on_another_dataset_get_their_own_folder(eval_data_dir, results_dir):
+    import os
+    import subprocess
+
+    env = {
+        name: value for name, value in os.environ.items()
+        if name not in ("DATA_DIR", "EVAL_DATA_DIR", "OUTPUT_DIR", "MAX_STEPS")
+    }
+    env["RUN"] = "xl_4x1x4_10ep"
+    if eval_data_dir:
+        env["EVAL_DATA_DIR"] = eval_data_dir
+    output = subprocess.run(
+        ["bash", "-c", "source slurm/env.sh; source slurm/load_run.sh; echo $EVAL_RESULTS_DIR"],
+        cwd=REPO_DIR, env=env, capture_output=True, text=True, check=True,
+    ).stdout
+    assert output.strip() == results_dir

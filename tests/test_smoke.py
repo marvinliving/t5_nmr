@@ -116,3 +116,64 @@ def test_evaluate_resume_and_combine(trained):
     )
     assert "top-2:" in stdout
     assert len((output_dir / "prd-test.txt").read_text().splitlines()) == 128
+
+
+def test_checkpoint_progress_scores_each_checkpoint(trained):
+    data_dir, output_dir, _ = trained
+    common = [
+        "scripts/checkpoint_progress.py", str(output_dir), "--base-model", MODEL_NAME,
+        "--batch-size", "4", "--max-new-tokens", "16",
+    ]
+    args = [*common, "--data-dir", str(data_dir), "--samples", "8"]
+    stdout = run(args)
+    assert "Exact match on 8 validation molecules" in stdout
+    progress_dir = output_dir / "progress" / "data_validation"
+    rows = (progress_dir / "progress.tsv").read_text().splitlines()
+    # The Trainer also saves at the last step, so final_model, which holds
+    # the same weights as checkpoint-3, is not scored again.
+    assert [row.split("\t")[0] for row in rows] == ["model", "checkpoint-2", "checkpoint-3"]
+    assert len((progress_dir / "checkpoint-3_predictions.txt").read_text().splitlines()) == 8
+
+    # Scores are kept, so a second run only prints the table.
+    stdout = run(args)
+    assert stdout.count("already scored") == 2
+
+
+def test_checkpoint_progress_on_all_of_an_external_test_set(trained, tmp_path):
+    _, output_dir, _ = trained
+    external = make_tiny_dataset(tmp_path / "external", rows=24)
+    args = [
+        "scripts/checkpoint_progress.py", str(output_dir), "--base-model", MODEL_NAME,
+        "--batch-size", "4", "--max-new-tokens", "16",
+        "--data-dir", str(external), "--split", "test", "--samples", "0",
+    ]
+    stdout = run(args)
+    assert "Exact match on 24 test molecules" in stdout
+    progress_dir = output_dir / "progress" / "external_test"
+    result = json.loads((progress_dir / "checkpoint-3.json").read_text())
+    assert result["samples"] == 24 and result["split"] == "test"
+
+    # A job stopped at its time limit after 10 molecules and half a line.
+    predictions = progress_dir / "checkpoint-3_predictions.txt"
+    lines = predictions.read_text().splitlines(keepends=True)
+    predictions.write_text("".join(lines[:10]) + "CC(")
+    settings = {key: result[key] for key in ("data_dir", "split", "samples", "max_new_tokens", "prefix")}
+    (progress_dir / "checkpoint-3.partial.json").write_text(json.dumps(settings))
+    (progress_dir / "checkpoint-3.json").unlink()
+    stdout = run(args)
+    assert "Resuming after 10 of 24 molecules" in stdout
+    assert len(predictions.read_text().splitlines()) == 24
+    assert not (progress_dir / "checkpoint-3.partial.json").exists()
+    assert json.loads((progress_dir / "checkpoint-3.json").read_text())["samples"] == 24
+
+
+def test_evaluation_results_go_to_output_dir(trained, tmp_path):
+    data_dir, output_dir, _ = trained
+    results_dir = tmp_path / "eval_external"
+    run([
+        "evaluate_exact_match.py", "--model-path", str(output_dir / "final_model"),
+        "--data-dir", str(data_dir), "--split", "test", "--batch-size", "4",
+        "--max-new-tokens", "16", "--sample-size", "4", "--output-dir", str(results_dir),
+    ])
+    assert (results_dir / "test_0_4_results.json").is_file()
+    assert (results_dir / "test_0_4_predictions.txt").is_file()

@@ -15,11 +15,11 @@ nvidia-smi
 
 python evaluate_exact_match.py \
   --model-path "$OUTPUT_DIR/final_model" \
-  --data-dir "$DATA_DIR" \
+  --data-dir "$EVAL_DATA_DIR" \
   --split test \
   --num-outputs "${NUM_OUTPUTS:-10}" \
   --batch-size "${EVAL_GENERATION_BATCH_SIZE:-16}" \
   --start-index 0 \
   --sample-size 10 \
-  --output-file "$OUTPUT_DIR/test_check.json" \
+  --output-file "$EVAL_RESULTS_DIR/test_check.json" \
   --local-files-only

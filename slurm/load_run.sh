@@ -48,3 +48,14 @@ if [ "${MAX_STEPS:-0}" -gt 0 ]; then
   OUTPUT_DIR="${OUTPUT_DIR}_max${MAX_STEPS}steps"
 fi
 export OUTPUT_DIR
+
+# Dataset that evaluate, check and progress score on: the run's own unless
+# EVAL_DATA_DIR is given, for example an external test set. Results on
+# another dataset go to their own folder, so they never overwrite (or get
+# combined with) the results on the run's own.
+export EVAL_DATA_DIR="${EVAL_DATA_DIR:-$DATA_DIR}"
+if [ "$EVAL_DATA_DIR" = "$DATA_DIR" ]; then
+  export EVAL_RESULTS_DIR="$OUTPUT_DIR"
+else
+  export EVAL_RESULTS_DIR="$OUTPUT_DIR/eval_$(basename "$EVAL_DATA_DIR")"
+fi

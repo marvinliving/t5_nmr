@@ -8,6 +8,9 @@
 #                                                 then combine_results.py once it succeeds
 #   ./submit.sh check <run> [--nodes N] [--gpus N] [sbatch options]
 #                                                 evaluate 10 molecules
+#   ./submit.sh progress <run> [--nodes N] [--gpus N] [sbatch options]
+#                                                 validation exact match of every
+#                                                 checkpoint, to see if it still improves
 #   ./submit.sh test-gpu [sbatch options]         GPU and PyTorch check
 #   ./submit.sh test-multi-gpu [sbatch options]   NCCL check on 4 GPUs (--nodes=2 for two nodes)
 #   ./submit.sh check-lengths [sbatch options]    SMILES longer than the token limits (no GPU)
@@ -26,7 +29,7 @@ source slurm/env.sh
 mkdir -p logs
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 1
 }
 
@@ -44,7 +47,7 @@ case "$job" in
   check-lengths)
     exec sbatch "$@" slurm/check_target_lengths.sbatch
     ;;
-  train|evaluate|check)
+  train|evaluate|check|progress)
     [ $# -ge 1 ] || usage
     export RUN="$1"
     shift
@@ -132,5 +135,17 @@ case "$job" in
       --time=00:20:00 \
       --export=ALL \
       "$@" slurm/evaluate_check.sbatch
+    ;;
+  progress)
+    exec sbatch \
+      --job-name="progress_$RUN" \
+      --nodes=1 \
+      --ntasks-per-node=1 \
+      --gpus-per-node=1 \
+      --cpus-per-task="$CPUS_PER_GPU" \
+      --mem="${EVAL_MEM:-64G}" \
+      --time="${PROGRESS_TIME:-04:00:00}" \
+      --export=ALL \
+      "$@" slurm/progress.sbatch
     ;;
 esac

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Evaluates outputs/<run>/final_model on the full test split as an array job:
 # task i of n evaluates the i-th of n equal chunks. Submit with
-# ./submit.sh evaluate <run>.
+# ./submit.sh evaluate <run>; EVAL_DATA_DIR=<folder> evaluates on another
+# dataset, with results in outputs/<run>/eval_<folder name>/.
 #SBATCH --output=logs/%x_%A_%a.out
 
 set -e
@@ -17,7 +18,7 @@ NUM_OUTPUTS="${NUM_OUTPUTS:-10}"
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
 
 if [ "$EVAL_SPLIT" = validation ]; then split_file=val; else split_file=test; fi
-TOTAL=$(wc -l < "$DATA_DIR/tgt-$split_file.txt")
+TOTAL=$(wc -l < "$EVAL_DATA_DIR/tgt-$split_file.txt")
 # EVAL_MAX_ROWS evaluates only the first rows, e.g. 20000 to compare recipes.
 if [ "${EVAL_MAX_ROWS:-0}" -gt 0 ] && [ "$EVAL_MAX_ROWS" -lt "$TOTAL" ]; then
   TOTAL="$EVAL_MAX_ROWS"
@@ -34,6 +35,8 @@ fi
 
 echo "Run: $RUN"
 echo "Model: $OUTPUT_DIR/final_model"
+echo "Data: $EVAL_DATA_DIR ($EVAL_SPLIT split)"
+echo "Results: $EVAL_RESULTS_DIR"
 echo "Array task: $SLURM_ARRAY_TASK_ID of $SLURM_ARRAY_TASK_COUNT"
 echo "Range: $START_INDEX + $CHUNK_SIZE of $TOTAL"
 echo "Outputs per spectrum: $NUM_OUTPUTS"
@@ -46,7 +49,8 @@ fi
 # --resume continues a chunk that was killed from where it stopped.
 python evaluate_exact_match.py \
   --model-path "$OUTPUT_DIR/final_model" \
-  --data-dir "$DATA_DIR" \
+  --data-dir "$EVAL_DATA_DIR" \
+  --output-dir "$EVAL_RESULTS_DIR" \
   --split "$EVAL_SPLIT" \
   --num-outputs "$NUM_OUTPUTS" \
   --batch-size "${EVAL_GENERATION_BATCH_SIZE:-16}" \

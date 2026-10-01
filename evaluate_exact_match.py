@@ -60,6 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--output-file", type=Path, default=None)
     parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Folder for the results when --output-file is not given. Defaults "
+            "to the run folder of final_model, or the model folder itself."
+        ),
+    )
+    parser.add_argument(
         "--predictions-file",
         type=Path,
         default=None,
@@ -143,10 +152,12 @@ def default_output_file(
     start_index: int,
     end_index: int,
     total_count: int,
+    output_dir: Optional[Path] = None,
 ) -> Path:
-    output_dir = (
-        model_path.parent if model_path.name == "final_model" else model_path
-    )
+    if output_dir is None:
+        output_dir = (
+            model_path.parent if model_path.name == "final_model" else model_path
+        )
     if start_index == 0 and end_index == total_count:
         filename = f"full_{split}_results.json"
     else:
@@ -336,6 +347,7 @@ def main() -> None:
         start_index,
         end_index,
         total_count,
+        args.output_dir,
     )
     partial_file = output_file.with_suffix(".partial.json")
     predictions_file = args.predictions_file or default_predictions_file(
