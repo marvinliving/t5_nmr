@@ -104,10 +104,12 @@ Predictions are written as they are made, so if the job reaches its time limit (
 
     ./submit.sh evaluate xl_4x4_10ep
 
-This is a Slurm array job. It splits the test molecules into 4 chunks (`EVAL_CHUNKS`) and evaluates them in parallel on separate GPUs. Chunks are rounded up to multiples of 1,000, so the 79,441 test molecules split at 0, 20,000, 40,000 and 60,000. Each chunk writes two files to the run's output folder:
+By default this is one job on one node with 4 GPUs. It splits the test molecules into 4 chunks and evaluates them in parallel, one per GPU. Chunks are rounded up to multiples of 1,000, so the 79,441 test molecules split at 0, 20,000, 40,000 and 60,000. Each chunk writes two files to the run's output folder:
 
 - `test_<start>_<end>_results.json`: top-1 to top-N exact-match scores. While a chunk is running, it saves progress to a matching `.partial.json` file.
 - `test_<start>_<end>_predictions.txt`: the model's N most likely SMILES for each spectrum, one per line, best first. Spectrum *i* in the chunk occupies lines *i*·N + 1 to (*i* + 1)·N. This is the same layout as `prd-test.txt` from earlier models.
+
+**GPUs and nodes.** The job is a Slurm array of `EVAL_CHUNKS` tasks (default 1), each on one node with `EVAL_GPUS` GPUs (default 4), and the split is cut into `EVAL_CHUNKS` × `EVAL_GPUS` chunks. Each GPU's log is `logs/eval_<run>_<job>_<task>_gpu<n>.out`. `EVAL_CHUNKS=4` uses 4 nodes and 16 chunks of 5,000; `EVAL_CHUNKS=4 EVAL_GPUS=1` is the old layout, 4 single-GPU tasks, with the same chunks as the default. Resubmit with the same two values to resume, since they set the chunk boundaries.
 
 **Speed.** Spectra are generated in batches of 16 (`EVAL_GENERATION_BATCH_SIZE`). Within each group of 100 batches, spectra are sorted by length so each batch needs little padding. Predictions are still written in dataset order.
 
@@ -240,7 +242,8 @@ NMR inputs are never truncated. T5 has no fixed maximum input length, so the who
 | `TRAIN_TIME` | `1-00:00:00` | Time limit of each training job |
 | `TRAIN_MEM` | `64G` on 1 GPU, whole node otherwise | Host memory of a training job |
 | `MAX_RESUBMITS` | 20 | How many times an unfinished run submits itself again |
-| `EVAL_CHUNKS` | 4 | Evaluation array tasks, one GPU each |
+| `EVAL_CHUNKS` | 1 | Evaluation array tasks, one node each |
+| `EVAL_GPUS` | 4 | GPUs per evaluation array task, each evaluating its own chunk; the split is cut into `EVAL_CHUNKS` × `EVAL_GPUS` chunks. Above 1, a task takes the node's memory (`EVAL_MEM` 0) |
 | `EVAL_DATA_DIR` | the run's `DATA_DIR` | Dataset that `evaluate`, `check` and `progress` use, for example an external test set. Results on another dataset go to `outputs/<run>/eval_<dataset>/` (`progress/<dataset>_<split>/` for `progress`) |
 | `EVAL_MAX_ROWS` | 0 | Evaluate only the first rows of the split, for example 20000; 0 evaluates all of it |
 | `EVAL_TIME` / `EVAL_MEM` | `10:00:00` / `64G` | Time limit and host memory of each evaluation chunk |

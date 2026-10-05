@@ -95,15 +95,18 @@ case "$job" in
       "$@" slurm/train.sbatch
     ;;
   evaluate)
-    chunks="${EVAL_CHUNKS:-4}"
+    chunks="${EVAL_CHUNKS:-1}"
+    # Each array task evaluates EVAL_GPUS chunks at once, one per GPU.
+    eval_gpus="${EVAL_GPUS:-4}"
+    if [ "$eval_gpus" -gt 1 ]; then default_eval_mem=0; else default_eval_mem=64G; fi
     eval_job=$(sbatch --parsable \
       --job-name="eval_$RUN" \
       --array="0-$((chunks - 1))" \
       --nodes=1 \
-      --ntasks-per-node=1 \
-      --gpus-per-node=1 \
+      --ntasks-per-node="$eval_gpus" \
+      --gpus-per-node="$eval_gpus" \
       --cpus-per-task="$CPUS_PER_GPU" \
-      --mem="${EVAL_MEM:-64G}" \
+      --mem="${EVAL_MEM:-$default_eval_mem}" \
       --time="${EVAL_TIME:-10:00:00}" \
       --export=ALL \
       "$@" slurm/evaluate.sbatch)
