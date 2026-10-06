@@ -11,13 +11,16 @@
 #   ./submit.sh progress <run> [--nodes N] [--gpus N] [sbatch options]
 #                                                 validation exact match of every
 #                                                 checkpoint, to see if it still improves
+#   ./submit.sh valid <run> [--nodes N] [--gpus N] [sbatch options]
+#                                                 top-n exact match of the evaluated
+#                                                 predictions counting only valid SMILES
 #   ./submit.sh test-gpu [sbatch options]         GPU and PyTorch check
 #   ./submit.sh test-multi-gpu [sbatch options]   NCCL check on 4 GPUs (--nodes=2 for two nodes)
 #   ./submit.sh check-lengths [sbatch options]    SMILES longer than the token limits (no GPU)
 #
 # --nodes and --gpus (GPUs per node) override the run's config; the run's
 # output folder then records the global batch, outputs/<run>_gb<N>, and
-# evaluate and check need the same values to find it.
+# evaluate, check and valid need the same values to find it.
 #
 # Variables not set in the config can be given at submission, for example a
 # smoke test: MAX_STEPS=50 ./submit.sh train xxl_2x2x4_10ep
@@ -29,7 +32,7 @@ source slurm/env.sh
 mkdir -p logs
 
 usage() {
-  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 1
 }
 
@@ -47,7 +50,7 @@ case "$job" in
   check-lengths)
     exec sbatch "$@" slurm/check_target_lengths.sbatch
     ;;
-  train|evaluate|check|progress)
+  train|evaluate|check|progress|valid)
     [ $# -ge 1 ] || usage
     export RUN="$1"
     shift
@@ -126,6 +129,19 @@ case "$job" in
       --time=00:30:00 \
       --export=ALL \
       slurm/combine.sbatch
+    ;;
+  valid)
+    # RDKit runs on CPUs only. A whole node bills the same as one core, so
+    # take all of it: one worker per core.
+    exec sbatch \
+      --job-name="valid_$RUN" \
+      --nodes=1 \
+      --ntasks-per-node=1 \
+      --cpus-per-task="$((CPUS_PER_GPU * 4))" \
+      --mem=0 \
+      --time="${VALID_TIME:-02:00:00}" \
+      --export=ALL \
+      "$@" slurm/valid_smiles.sbatch
     ;;
   check)
     exec sbatch \

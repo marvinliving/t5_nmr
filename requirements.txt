@@ -10,3 +10,5 @@ sentencepiece==0.2.1
 safetensors==0.8.0
 numpy==2.4.6
 tqdm==4.68.3
+# Only scripts/valid_smiles.py (./submit.sh valid) needs RDKit.
+rdkit==2025.9.2

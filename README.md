@@ -149,6 +149,21 @@ This script:
 
 Each chunk's results record the size of the test set. Results from evaluations made before this was added don't, so for those the script counts the test set in the run's `DATA_DIR`, or in the folder given by `--data-dir`. `--total 79441` skips the count.
 
+### 5. Score valid SMILES only
+
+    ./submit.sh valid xl_4x4_10ep
+    EVAL_DATA_DIR=/projects/b5an/nmr_expt_data ./submit.sh valid xl_4x4_10ep
+
+Once the combine job has written `prd-test.txt`, this CPU job runs `scripts/valid_smiles.py` on it. It checks every candidate with RDKit and scores top-1 to top-N three ways:
+
+- `raw_exact`: exact match as the evaluation scores it. It should equal the run's row in `reports/evaluation_summary.tsv`.
+- `valid_exact`: exact match after dropping candidates RDKit can't parse, so the *n*-th valid candidate moves up to rank *n*.
+- `valid_canonical`: as `valid_exact`, but comparing RDKit canonical SMILES, so the same molecule written differently counts, and a molecule repeated among the candidates is kept only once.
+
+It also reports the share of valid candidates, overall and at each rank, and how many reference SMILES RDKit can't parse; those can never score a canonical match. Accuracies are over all spectra. The table is in `logs/valid_<run>_<job>.out` and in `prd-test_valid.json` next to the predictions. A whole node bills the same as one core, so the job takes the node and runs one RDKit worker per core. It needs RDKit in the environment (`pip install rdkit`). To run it by hand, on any predictions file:
+
+    python scripts/valid_smiles.py outputs/<run>/prd-test.txt --data-dir /projects/b5an/alberts_2d
+
 ## Runs
 
 Each file in `configs/train/` is one run. It holds only the settings that differ from the defaults, for example `configs/train/xxl_2x2x4_10ep.env`:
@@ -253,6 +268,7 @@ NMR inputs are never truncated. T5 has no fixed maximum input length, so the who
 | `PROGRESS_SPLIT` | `validation` | Split that `./submit.sh progress` scores: `validation` or `test` |
 | `PROGRESS_SAMPLES` | 2000 | Molecules (the first ones of the split) that `./submit.sh progress` scores each model on; 0 uses all |
 | `PROGRESS_TIME` | `04:00:00` | Time limit of the progress job. Submitted again, it carries on where it stopped |
+| `VALID_TIME` | `02:00:00` | Time limit of `./submit.sh valid` |
 
 Other `sbatch` options can be added after the run name, for example `./submit.sh train xl_4x1x4_10ep --qos=long`. They apply only to the first job, not to the jobs it resubmits.
 
