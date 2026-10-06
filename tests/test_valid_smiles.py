@@ -26,6 +26,14 @@ def test_canonical_rejects_invalid_smiles():
     assert canonical("OCC") == canonical("CCO") == "CCO"
 
 
+def test_canonical_reads_space_separated_tokens():
+    # As stored in tgt-*.txt: without joining, RDKit would read only "C".
+    assert canonical("C c 1 c c c ( Cl ) c c 1") == canonical("Cc1ccc(Cl)cc1")
+    assert canonical("N [C@@H] ( C ) C ( = O ) O") == canonical("N[C@@H](C)C(=O)O")
+    assert canonical("C c 1 c c c") is None  # unclosed ring, not just "C"
+    assert canonical("c 1 c c c c c 1") is not None
+
+
 def test_invalid_candidate_no_longer_takes_a_rank():
     result = score_lists([["C1CC", "CCO", "N"]], ["CCO"])
     assert result["top_n_matches"]["raw_exact"] == [0, 1, 1]

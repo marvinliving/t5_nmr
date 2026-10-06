@@ -75,7 +75,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def canonical(smiles: str) -> Optional[str]:
-    """RDKit canonical SMILES, or None if RDKit cannot parse it."""
+    """RDKit canonical SMILES, or None if RDKit cannot parse it.
+
+    The datasets store SMILES as space-separated tokens ("C C ( = O ) O").
+    RDKit reads everything after the first space as the molecule's name, so
+    the tokens are joined first.
+    """
+    smiles = "".join(smiles.split())
     if not smiles:
         return None
     mol = Chem.MolFromSmiles(smiles)
