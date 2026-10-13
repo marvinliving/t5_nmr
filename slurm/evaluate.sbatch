@@ -8,6 +8,9 @@
 
 set -e
 export PYTHONUNBUFFERED=1
+# Beam search grows the decoder cache one token at a time, which fragments
+# GPU memory without expandable segments.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 cd "$SLURM_SUBMIT_DIR"
 source slurm/env.sh

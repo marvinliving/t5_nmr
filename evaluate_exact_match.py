@@ -277,19 +277,42 @@ def run_evaluation(
                     batches.append([index])
                     longest = lengths[index]
 
-            candidates_by_index: Dict[int, List[str]] = {}
-            for indices in batches:
+            def generate(indices: List[int]) -> List[List[str]]:
+                """Candidates for each spectrum in indices, best first.
+
+                The decoder cache grows with the longest output in the batch,
+                which is unknown beforehand, so a batch that runs out of GPU
+                memory is split in half and retried.
+                """
                 encoded, _ = collate([window[index] for index in indices])
                 encoded = {
                     name: tensor.to(device) for name, tensor in encoded.items()
                 }
-                generated = model.generate(
-                    **encoded,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    num_beams=num_outputs,
-                    num_return_sequences=num_outputs,
-                )
+                try:
+                    generated = model.generate(
+                        **encoded,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        num_beams=num_outputs,
+                        num_return_sequences=num_outputs,
+                    )
+                except torch.OutOfMemoryError:
+                    if len(indices) == 1:
+                        raise
+                    out_of_memory = True
+                else:
+                    out_of_memory = False
+                if out_of_memory:
+                    # Retried outside the except block so the failed attempt's
+                    # tensors can be freed first.
+                    del encoded
+                    torch.cuda.empty_cache()
+                    half = len(indices) // 2
+                    tqdm.write(
+                        f"Out of memory on {len(indices)} spectra; "
+                        f"retrying as {half} + {len(indices) - half}"
+                    )
+                    return generate(indices[:half]) + generate(indices[half:])
                 predictions = [
                     prediction.strip()
                     for prediction in tokenizer.batch_decode(
@@ -297,10 +320,15 @@ def run_evaluation(
                     )
                 ]
                 # Beam search returns each spectrum's outputs together, best first.
-                for position, index in enumerate(indices):
-                    candidates_by_index[index] = predictions[
-                        position * num_outputs:(position + 1) * num_outputs
-                    ]
+                return [
+                    predictions[position * num_outputs:(position + 1) * num_outputs]
+                    for position in range(len(indices))
+                ]
+
+            candidates_by_index: Dict[int, List[str]] = {}
+            for indices in batches:
+                for index, candidates in zip(indices, generate(indices)):
+                    candidates_by_index[index] = candidates
                 progress.update(len(indices))
 
             targets = list(window["tgt"])
