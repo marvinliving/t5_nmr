@@ -46,6 +46,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=640)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
+        "--max-batch-tokens",
+        type=int,
+        default=100_000,
+        help=(
+            "Cap on batch rows x --num-outputs x longest input tokens, which "
+            "sets the size of the cross-attention cache; long spectra get "
+            "smaller batches than --batch-size. 0 means no cap."
+        ),
+    )
+    parser.add_argument(
         "--start-index",
         type=int,
         default=0,
@@ -119,6 +129,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-new-tokens must be positive")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
+    if args.max_batch_tokens < 0:
+        raise ValueError("--max-batch-tokens must be non-negative")
     if args.start_index < 0:
         raise ValueError("--start-index must be non-negative")
     if args.sample_size < 0:
@@ -206,6 +218,7 @@ def run_evaluation(
     device: torch.device,
     prefix: str = DEFAULT_PREFIX,
     batch_size: int = 16,
+    max_batch_tokens: int = 0,
     num_outputs: int = 1,
     max_new_tokens: int = 640,
     sort_by_length: bool = True,
@@ -217,7 +230,10 @@ def run_evaluation(
 
     dataset has "src" and "tgt" columns. It is processed in windows of
     window_batches batches. Within a window, spectra are sorted by length so
-    each batch pads to similar lengths; predictions are written to
+    each batch pads to similar lengths. With max_batch_tokens, a batch also
+    stops before rows x num_outputs x its longest input in tokens would exceed
+    it, since beam search caches every input token for every beam; a spectrum
+    over the cap still runs alone. Predictions are written to
     predictions_handle in dataset order at the end of each window, and
     on_window(processed, top_n_matches) is called after each write.
 
@@ -230,24 +246,39 @@ def run_evaluation(
     processed = 0
 
     model.eval()
-    progress = tqdm(
-        total=(len(dataset) + batch_size - 1) // batch_size,
-        desc="Generating",
-        unit="batch",
-    )
+    progress = tqdm(total=len(dataset), desc="Generating", unit="spectrum")
     with torch.inference_mode():
         for window_start in range(0, len(dataset), window_size):
             window = dataset.select(
                 range(window_start, min(window_start + window_size, len(dataset)))
             )
+            lengths = [
+                len(ids)
+                for ids in tokenizer(
+                    [prefix + source for source in window["src"]]
+                )["input_ids"]
+            ]
             order = list(range(len(window)))
             if sort_by_length:
-                sources = list(window["src"])
-                order.sort(key=lambda index: len(sources[index]), reverse=True)
+                order.sort(key=lambda index: lengths[index], reverse=True)
+
+            batches: List[List[int]] = []
+            longest = 0
+            for index in order:
+                longest_with = max(longest, lengths[index])
+                if batches and len(batches[-1]) < batch_size and (
+                    max_batch_tokens == 0
+                    or (len(batches[-1]) + 1) * num_outputs * longest_with
+                    <= max_batch_tokens
+                ):
+                    batches[-1].append(index)
+                    longest = longest_with
+                else:
+                    batches.append([index])
+                    longest = lengths[index]
 
             candidates_by_index: Dict[int, List[str]] = {}
-            for batch_start in range(0, len(order), batch_size):
-                indices = order[batch_start:batch_start + batch_size]
+            for indices in batches:
                 encoded, _ = collate([window[index] for index in indices])
                 encoded = {
                     name: tensor.to(device) for name, tensor in encoded.items()
@@ -270,7 +301,7 @@ def run_evaluation(
                     candidates_by_index[index] = predictions[
                         position * num_outputs:(position + 1) * num_outputs
                     ]
-                progress.update(1)
+                progress.update(len(indices))
 
             targets = list(window["tgt"])
             for index in range(len(window)):
@@ -376,6 +407,7 @@ def main() -> None:
     print("Already done (resume):", resumed, flush=True)
     print("Outputs per spectrum:", args.num_outputs, flush=True)
     print("Batch size:", args.batch_size, flush=True)
+    print("Max batch tokens:", args.max_batch_tokens or "no cap", flush=True)
     print("Sort by length:", args.sort_by_length, flush=True)
     print("Device:", device, flush=True)
     print("Dtype:", model_dtype, flush=True)
@@ -430,6 +462,7 @@ def main() -> None:
                 device=device,
                 prefix=args.prefix,
                 batch_size=args.batch_size,
+                max_batch_tokens=args.max_batch_tokens,
                 num_outputs=args.num_outputs,
                 max_new_tokens=args.max_new_tokens,
                 sort_by_length=args.sort_by_length,
@@ -457,6 +490,7 @@ def main() -> None:
         "predictions_file": str(predictions_file.resolve()),
         "max_new_tokens": args.max_new_tokens,
         "batch_size": args.batch_size,
+        "max_batch_tokens": args.max_batch_tokens,
         "sort_by_length": args.sort_by_length,
         "resumed_samples": resumed,
         "slurm_job_id": slurm_job_id,
