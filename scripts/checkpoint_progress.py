@@ -3,19 +3,30 @@
     python scripts/checkpoint_progress.py outputs/xl_4x1x4_10ep \
         --base-model google/flan-t5-xl --data-dir /projects/b5an/nmr_expt_data --split test
 
-Generates SMILES for the first molecules of a split (or all of them) with
-each checkpoint-<step> in the output folder and with final_model, and prints
-a table of top-1 exact match next to each one's epoch and validation loss. If
-exact match is still rising from one checkpoint to the next, the model is
-still learning. The dataset can be the run's own or another one, such as an
-external test set.
+Generates SMILES for the first molecules of a split (1,000 by default, or all
+of them) with each checkpoint-<step> in the output folder and with
+final_model, and prints a table of exact match next to each one's epoch,
+training loss and validation loss. If exact match is still rising from one
+checkpoint to the next, the model is still learning; if it falls while the
+training loss keeps falling, it is overtraining. The dataset can be the run's
+own or another one; ./submit.sh progress (slurm/progress.sbatch) scores the
+test split of the external dataset, nmr_expt_data, by default.
+
+--num-outputs 1 is greedy top-1. A larger value uses beam search and scores
+top-1 to top-N, for example --num-outputs 10.
 
 FSDP checkpoints hold one shard per GPU; they are read straight into one
-model, so this needs one GPU whatever the run trained on. Results are kept in
-<output dir>/progress/<dataset>_<split>/ and reused, so running it again only
-scores new checkpoints, and a checkpoint's score stays after training
-deletes the checkpoint itself. A model whose scoring was interrupted is
-resumed from its predictions file.
+model, so each model needs one GPU whatever the run trained on. With --task i
+--tasks n, a process scores only every n-th model still to do, so
+progress.sbatch runs one per GPU, each on its own share; --table-only then
+prints the table of all of them.
+
+Results are kept in <output dir>/progress/<dataset>_<split>/ (with _top<N>
+for N > 1) and reused, so running it again only scores new checkpoints, and a
+checkpoint's score stays after training deletes the checkpoint itself. A
+model whose scoring was interrupted is resumed from its predictions file.
+Both losses are read again from trainer_state.json (see loss_curve.py) each
+time the table is built.
 """
 
 import argparse
@@ -31,13 +42,18 @@ from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer
 REPO_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_DIR))
 
-from evaluate_exact_match import choose_dtype, resume_predictions, run_evaluation  # noqa: E402
+from evaluate_exact_match import (  # noqa: E402
+    choose_dtype,
+    resume_predictions,
+    run_evaluation,
+    top_n_exact_match,
+)
+from loss_curve import eval_loss_at, mean_train_loss, read_history  # noqa: E402
 from nmr_data import DEFAULT_PREFIX, load_split  # noqa: E402
 from t5_train import final_model_is_complete, fix_t5_embeddings  # noqa: E402
 
 # Where accelerate saves an FSDP SHARDED_STATE_DICT checkpoint's model.
 FSDP_MODEL_DIR = "pytorch_model_fsdp_0"
-TABLE_COLUMNS = ["model", "epoch", "step", "eval_loss", "exact_match", "samples"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,14 +69,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--samples",
         type=int,
-        default=2000,
+        default=1000,
         help="Molecules to score, the first ones of the split; 0 uses all",
     )
+    parser.add_argument(
+        "--num-outputs",
+        type=int,
+        default=1,
+        help=(
+            "Candidate SMILES per spectrum: 1 is greedy top-1; N > 1 is beam "
+            "search, scored top-1 to top-N"
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--max-batch-tokens",
+        type=int,
+        default=100_000,
+        help=(
+            "Cap on batch rows x --num-outputs x longest input tokens, which "
+            "sets the size of the cross-attention cache; long spectra get "
+            "smaller batches than --batch-size. 0 means no cap."
+        ),
+    )
     parser.add_argument("--max-new-tokens", type=int, default=640)
     parser.add_argument("--prefix", default=DEFAULT_PREFIX)
+    parser.add_argument(
+        "--task",
+        type=int,
+        default=0,
+        help=(
+            "Score only every n-th model still to do, starting at the i-th "
+            "(i = --task, n = --tasks); progress.sbatch runs one per GPU"
+        ),
+    )
+    parser.add_argument("--tasks", type=int, default=1, help="See --task")
+    parser.add_argument(
+        "--table-only",
+        action="store_true",
+        help="Print and save the table of models already scored, without scoring",
+    )
     parser.add_argument("--local-files-only", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 0 <= args.task < args.tasks:
+        parser.error(f"--task must be from 0 to --tasks - 1, got {args.task} of {args.tasks}")
+    if args.num_outputs < 1:
+        parser.error("--num-outputs must be 1 or more")
+    return args
 
 
 def find_models(output_dir: Path) -> list[Path]:
@@ -87,19 +142,12 @@ def find_models(output_dir: Path) -> list[Path]:
 
 
 def eval_losses(output_dir: Path) -> dict[int, float]:
-    """Validation loss by step, from every trainer_state.json of the run.
-
-    A checkpoint saved in the same step as an evaluation can be written
-    before it (at the last step of a MAX_STEPS run), so its own history may
-    lack the loss that a later one records.
-    """
-    losses = {}
-    for path in [*output_dir.glob("checkpoint-*/trainer_state.json"), output_dir / "trainer_state.json"]:
-        if path.is_file():
-            for entry in json.loads(path.read_text())["log_history"]:
-                if "eval_loss" in entry:
-                    losses[entry["step"]] = entry["eval_loss"]
-    return losses
+    """Validation loss by step, from every trainer_state.json of the run."""
+    return {
+        entry["step"]: entry["eval_loss"]
+        for entry in read_history(output_dir)
+        if "eval_loss" in entry
+    }
 
 
 def training_progress(model_dir: Path, output_dir: Path, losses: dict[int, float]) -> dict:
@@ -118,6 +166,12 @@ def training_progress(model_dir: Path, output_dir: Path, losses: dict[int, float
         "step": state["global_step"],
         "eval_loss": losses.get(state["global_step"]),
     }
+
+
+def same_settings(result: dict, settings: dict) -> bool:
+    """result was scored with settings. Results from before --num-outputs are top-1."""
+    result = {"num_outputs": 1, **result}
+    return all(result.get(key) == value for key, value in settings.items())
 
 
 def load_sharded_weights(model: torch.nn.Module, shard_dir: Path) -> None:
@@ -167,52 +221,36 @@ def load_model(
     return model
 
 
-def print_table(rows: list[dict]) -> None:
-    print("\t".join(TABLE_COLUMNS + ["change"]))
-    previous = None
-    for row in rows:
-        change = "" if previous is None else f"{row['exact_match'] - previous:+.4f}"
-        previous = row["exact_match"]
-        values = [
-            "" if row[column] is None
-            else f"{row[column]:.4f}" if isinstance(row[column], float) and column != "epoch"
-            else str(row[column])
-            for column in TABLE_COLUMNS
-        ]
-        print("\t".join(values + [change]))
+def score_models(args: argparse.Namespace, progress_dir: Path, dataset, settings: dict) -> None:
+    """Score this task's share of the models not yet scored with settings.
 
+    Every task lists the same models within its first seconds, before any
+    scoring finishes, so no two tasks pick the same model. A model with a
+    .partial.json is still to do, and is resumed by whichever task gets it.
+    """
+    todo = []
+    for model_dir in find_models(args.output_dir):
+        result_path = progress_dir / f"{model_dir.name}.json"
+        if result_path.is_file() and same_settings(json.loads(result_path.read_text()), settings):
+            print(f"{model_dir.name}: already scored")
+        else:
+            todo.append(model_dir)
+    mine = todo[args.task::args.tasks]
+    print(
+        f"Task {args.task} of {args.tasks}: scoring "
+        f"{', '.join(model_dir.name for model_dir in mine) or 'nothing'}"
+    )
+    if not mine:
+        return
 
-def main() -> None:
-    args = parse_args()
-    progress_dir = args.output_dir / "progress" / f"{args.data_dir.resolve().name}_{args.split}"
-    progress_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = choose_dtype(device)
-
-    dataset = load_split(args.data_dir, args.split)
-    if 0 < args.samples < len(dataset):
-        dataset = dataset.select(range(args.samples))
     targets = list(dataset["tgt"])
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, use_fast=True, local_files_only=args.local_files_only
     )
-    settings = {
-        "data_dir": str(args.data_dir.resolve()),
-        "split": args.split,
-        "samples": len(dataset),
-        "max_new_tokens": args.max_new_tokens,
-        "prefix": args.prefix,
-    }
-
     losses = eval_losses(args.output_dir)
-    for model_dir in find_models(args.output_dir):
-        result_path = progress_dir / f"{model_dir.name}.json"
-        if result_path.is_file():
-            previous = json.loads(result_path.read_text())
-            if all(previous.get(key) == value for key, value in settings.items()):
-                print(f"{model_dir.name}: already scored")
-                continue
-
+    for model_dir in mine:
         print(f"===== {model_dir.name} =====")
         start = time.time()
         try:
@@ -228,25 +266,28 @@ def main() -> None:
         # time limit carries on from them when submitted again.
         predictions_path = progress_dir / f"{model_dir.name}_predictions.txt"
         partial_path = progress_dir / f"{model_dir.name}.partial.json"
-        done, matches = 0, [0]
-        if partial_path.is_file() and json.loads(partial_path.read_text()) == settings:
-            done, matches = resume_predictions(predictions_path, targets, 1)
+        done, matches = 0, [0] * args.num_outputs
+        if partial_path.is_file() and same_settings(json.loads(partial_path.read_text()), settings):
+            done, matches = resume_predictions(predictions_path, targets, args.num_outputs)
             print(f"Resuming after {done} of {len(dataset)} molecules")
         else:
             partial_path.write_text(json.dumps(settings, indent=2) + "\n")
             predictions_path.write_text("")
         with predictions_path.open("a", encoding="utf-8") as predictions:
             if done < len(dataset):
-                matches[0] += run_evaluation(
+                new = run_evaluation(
                     model,
                     tokenizer,
                     dataset.select(range(done, len(dataset))),
                     device=device,
                     prefix=args.prefix,
                     batch_size=args.batch_size,
+                    max_batch_tokens=args.max_batch_tokens,
+                    num_outputs=args.num_outputs,
                     max_new_tokens=args.max_new_tokens,
                     predictions_handle=predictions,
-                )[0]
+                )
+                matches = [old + added for old, added in zip(matches, new)]
         del model
         torch.cuda.empty_cache()
 
@@ -254,42 +295,98 @@ def main() -> None:
             "model": model_dir.name,
             **progress,
             "exact_match": matches[0] / len(dataset),
+            **top_n_exact_match(matches, len(dataset)),
             **settings,
             "seconds": round(time.time() - start, 1),
         }
-        result_path.write_text(json.dumps(result, indent=2) + "\n")
+        (progress_dir / f"{model_dir.name}.json").write_text(json.dumps(result, indent=2) + "\n")
         partial_path.unlink()
         print(f"{model_dir.name}: exact match {result['exact_match']:.4f}")
 
-    # Every model scored with these settings, including checkpoints that
-    # training has since deleted.
-    losses = eval_losses(args.output_dir)
+
+def print_table(rows: list[dict], columns: list[str]) -> None:
+    print("\t".join(columns + ["change"]))
+    previous = None
+    for row in rows:
+        change = "" if previous is None else f"{row['exact_match'] - previous:+.4f}"
+        previous = row["exact_match"]
+        values = [
+            "" if row.get(column) is None
+            else f"{row[column]:.4f}" if isinstance(row[column], float) and column != "epoch"
+            else str(row[column])
+            for column in columns
+        ]
+        print("\t".join(values + [change]))
+
+
+def write_table(args: argparse.Namespace, progress_dir: Path, settings: dict) -> None:
+    """Print and save the table of every model scored with settings.
+
+    It includes checkpoints that training has since deleted. Both losses are
+    read again from trainer_state.json, since they may have been logged after
+    the model was scored.
+    """
+    history = read_history(args.output_dir)
     rows = []
     for path in progress_dir.glob("*.json"):
         if path.name.endswith(".partial.json"):
             continue
-        result = json.loads(path.read_text())
-        if all(result.get(key) == value for key, value in settings.items()):
-            # The loss may have been logged after the model was scored.
-            result["eval_loss"] = losses.get(result["step"], result["eval_loss"])
-            rows.append(result)
+        row = json.loads(path.read_text())
+        if same_settings(row, settings):
+            row["eval_loss"] = eval_loss_at(history, row["step"]) or row["eval_loss"]
+            row["train_loss"] = mean_train_loss(history, row["epoch"])
+            rows.append(row)
     rows.sort(key=lambda row: row["step"])
     if not rows:
-        print("No checkpoints to score in", args.output_dir)
+        print("No checkpoints scored yet in", args.output_dir)
         return
 
+    num_outputs = settings["num_outputs"]
+    columns = [
+        "model", "epoch", "step", "train_loss", "eval_loss", "exact_match",
+        *(f"top_{rank}" for rank in range(2, num_outputs + 1)),
+        "samples",
+    ]
     with (progress_dir / "progress.tsv").open("w", newline="") as file:
-        writer = csv.DictWriter(
-            file, fieldnames=TABLE_COLUMNS, delimiter="\t", extrasaction="ignore"
-        )
+        writer = csv.DictWriter(file, fieldnames=columns, delimiter="\t", extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+    if num_outputs == 1:
+        scored = "Exact match"
+    else:
+        scored = f"Top-1 to top-{num_outputs} exact match (beam search)"
     print(
-        f"\n===== Exact match on {len(dataset)} {args.split} molecules "
+        f"\n===== {scored} on {settings['samples']} {args.split} molecules "
         f"of {args.data_dir} ====="
     )
-    print_table(rows)
+    print_table(rows, columns)
     print("Saved to:", progress_dir / "progress.tsv")
+
+
+def main() -> None:
+    args = parse_args()
+    folder = f"{args.data_dir.resolve().name}_{args.split}"
+    if args.num_outputs > 1:
+        # Kept apart, so a top-10 run never replaces the top-1 scores.
+        folder += f"_top{args.num_outputs}"
+    progress_dir = args.output_dir / "progress" / folder
+    progress_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset = load_split(args.data_dir, args.split)
+    if 0 < args.samples < len(dataset):
+        dataset = dataset.select(range(args.samples))
+    settings = {
+        "data_dir": str(args.data_dir.resolve()),
+        "split": args.split,
+        "samples": len(dataset),
+        "max_new_tokens": args.max_new_tokens,
+        "prefix": args.prefix,
+        "num_outputs": args.num_outputs,
+    }
+
+    if not args.table_only:
+        score_models(args, progress_dir, dataset, settings)
+    write_table(args, progress_dir, settings)
 
 
 if __name__ == "__main__":

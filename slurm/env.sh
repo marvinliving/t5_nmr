@@ -15,6 +15,9 @@ CPUS_PER_GPU="${CPUS_PER_GPU:-72}"
 export DATA_DIR="${DATA_DIR:-/projects/b5an/alberts_2d}"
 # Datasets ./submit.sh check-lengths checks, separated by spaces.
 CHECK_DATA_DIRS="${CHECK_DATA_DIRS:-/projects/b5an/alberts_2d /projects/b5an/nmr_expt_data}"
+# Dataset ./submit.sh progress scores checkpoints on unless EVAL_DATA_DIR
+# is given: the external, experimental spectra.
+PROGRESS_DATA_DIR="${PROGRESS_DATA_DIR:-/projects/b5an/nmr_expt_data}"
 
 
 # ===== Job environment =====

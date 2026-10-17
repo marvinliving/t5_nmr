@@ -8,9 +8,11 @@
 #                                                 then combine_results.py once it succeeds
 #   ./submit.sh check <run> [--nodes N] [--gpus N] [sbatch options]
 #                                                 evaluate 10 molecules
-#   ./submit.sh progress <run> [--nodes N] [--gpus N] [sbatch options]
-#                                                 validation exact match of every
-#                                                 checkpoint, to see if it still improves
+#   ./submit.sh progress <run> [--samples N] [--top N] [--nodes N] [--gpus N] [sbatch options]
+#                                                 exact match of every saved checkpoint,
+#                                                 on one node with 4 GPUs: has training
+#                                                 levelled off? Default: greedy top-1 on
+#                                                 1000 external test molecules
 #   ./submit.sh valid <run> [--nodes N] [--gpus N] [sbatch options]
 #                                                 top-n exact match of the evaluated
 #                                                 predictions counting only valid SMILES
@@ -32,8 +34,16 @@ source slurm/env.sh
 mkdir -p logs
 
 usage() {
-  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 1
+}
+
+# --samples and --top only mean something to the progress job.
+progress_only() {
+  if [ "$job" != progress ]; then
+    echo "$1 is only for ./submit.sh progress" >&2
+    exit 1
+  fi
 }
 
 [ $# -ge 1 ] || usage
@@ -54,7 +64,9 @@ case "$job" in
     [ $# -ge 1 ] || usage
     export RUN="$1"
     shift
-    # Take --nodes and --gpus out of the options; the rest go to sbatch.
+    # Take --nodes, --gpus, --samples and --top out of the options; the rest
+    # go to sbatch. Like --nodes and --gpus, --samples and --top are kept in
+    # CLI_* variables so they win over the run's config.
     sbatch_options=()
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -62,11 +74,19 @@ case "$job" in
         --nodes) export CLI_NODES="$2"; shift ;;
         --gpus=*) export CLI_GPUS="${1#*=}" ;;
         --gpus) export CLI_GPUS="$2"; shift ;;
+        --samples=*) progress_only "$1"; export CLI_PROGRESS_SAMPLES="${1#*=}" ;;
+        --samples) progress_only "$1"; export CLI_PROGRESS_SAMPLES="$2"; shift ;;
+        --top=*) progress_only "$1"; export CLI_PROGRESS_TOP="${1#*=}" ;;
+        --top) progress_only "$1"; export CLI_PROGRESS_TOP="$2"; shift ;;
         *) sbatch_options+=("$1") ;;
       esac
       shift
     done
     set -- "${sbatch_options[@]}"
+    if [ "$job" = progress ]; then
+      # progress scores the external test set unless EVAL_DATA_DIR names another.
+      export EVAL_DATA_DIR="${EVAL_DATA_DIR:-$PROGRESS_DATA_DIR}"
+    fi
     source slurm/load_run.sh
     ;;
   *)
@@ -156,13 +176,21 @@ case "$job" in
       "$@" slurm/evaluate_check.sbatch
     ;;
   progress)
+    samples="${CLI_PROGRESS_SAMPLES:-${PROGRESS_SAMPLES:-1000}}"
+    top="${CLI_PROGRESS_TOP:-${PROGRESS_TOP:-1}}"
+    [[ "$samples" =~ ^[0-9]+$ ]] || { echo "--samples must be 0 or more, got $samples" >&2; exit 1; }
+    [[ "$top" =~ ^[1-9][0-9]*$ ]] || { echo "--top must be 1 or more, got $top" >&2; exit 1; }
+    # One node; each GPU scores its own share of the checkpoints.
+    gpus="${PROGRESS_GPUS:-4}"
+    if [ "$gpus" -gt 1 ]; then default_progress_mem=0; else default_progress_mem=64G; fi
+    echo "Scoring the checkpoints in $OUTPUT_DIR on $EVAL_DATA_DIR (${PROGRESS_SPLIT:-test}), $samples molecules, top-$top, $gpus GPUs"
     exec sbatch \
       --job-name="progress_$RUN" \
       --nodes=1 \
-      --ntasks-per-node=1 \
-      --gpus-per-node=1 \
+      --ntasks-per-node="$gpus" \
+      --gpus-per-node="$gpus" \
       --cpus-per-task="$CPUS_PER_GPU" \
-      --mem="${EVAL_MEM:-64G}" \
+      --mem="${PROGRESS_MEM:-$default_progress_mem}" \
       --time="${PROGRESS_TIME:-04:00:00}" \
       --export=ALL \
       "$@" slurm/progress.sbatch

@@ -68,6 +68,7 @@ class TrainConfig:
     # ===== Throughput (no effect on the optimisation) =====
     eval_batch_size: int
     eval_max_samples: int
+    logging_steps: int
     dataloader_num_workers: int
     group_by_length: bool
 
@@ -172,6 +173,9 @@ class TrainConfig:
             # Validation loss is diagnostic only; the first rows are used so
             # the number is comparable across runs. 0 uses the whole split.
             eval_max_samples=env_int("EVAL_MAX_SAMPLES", 5000),
+            # Updates between training-loss entries in the log and in
+            # trainer_state.json: the spacing of the training-loss curve.
+            logging_steps=env_int("LOGGING_STEPS", 500),
             dataloader_num_workers=env_int("DATALOADER_NUM_WORKERS", 4),
             # Changes the order samples are drawn in, so off by default until
             # validated against a run without it.

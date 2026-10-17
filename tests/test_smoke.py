@@ -5,6 +5,7 @@ downloads the model on first use (about 300 MB) and takes a few minutes.
 It checks the pipeline runs and writes its files, not that the model learns.
 """
 
+import csv
 import json
 import os
 import subprocess
@@ -48,6 +49,8 @@ def trained(tmp_path_factory):
         "TRAIN_BATCH_SIZE": "4",
         "GRAD_ACCUMULATION_STEPS": "1",
         "EVAL_MAX_SAMPLES": "16",
+        # A training-loss entry at every step, for the loss curve.
+        "LOGGING_STEPS": "1",
         "TEST_SAMPLE_SIZE": "8",
         "GENERATION_BATCH_SIZE": "4",
         "GENERATION_MAX_NEW_TOKENS": "16",
@@ -165,6 +168,66 @@ def test_checkpoint_progress_on_all_of_an_external_test_set(trained, tmp_path):
     assert len(predictions.read_text().splitlines()) == 24
     assert not (progress_dir / "checkpoint-3.partial.json").exists()
     assert json.loads((progress_dir / "checkpoint-3.json").read_text())["samples"] == 24
+
+
+def read_tsv(path: Path) -> list[dict]:
+    with path.open(newline="") as file:
+        return list(csv.DictReader(file, delimiter="\t"))
+
+
+def test_checkpoint_progress_shares_models_between_tasks(trained, tmp_path):
+    _, output_dir, _ = trained
+    shared = make_tiny_dataset(tmp_path / "shared", rows=8)
+    args = [
+        "scripts/checkpoint_progress.py", str(output_dir), "--base-model", MODEL_NAME,
+        "--batch-size", "4", "--max-new-tokens", "16",
+        "--data-dir", str(shared), "--split", "test", "--samples", "8",
+    ]
+    progress_dir = output_dir / "progress" / "shared_test"
+
+    def scored():
+        return sorted(path.name for path in progress_dir.glob("checkpoint-*.json"))
+
+    # In the job the tasks list the models at the same time. Run one after
+    # the other, task 1 goes first, so task 0 still finds both models to do.
+    stdout = run([*args, "--task", "1", "--tasks", "2"])
+    assert "Task 1 of 2: scoring checkpoint-3" in stdout
+    assert scored() == ["checkpoint-3.json"]
+    stdout = run([*args, "--task", "0", "--tasks", "2"])
+    assert "Task 0 of 2: scoring checkpoint-2" in stdout
+    assert scored() == ["checkpoint-2.json", "checkpoint-3.json"]
+
+    stdout = run([*args, "--table-only"])
+    assert "scoring" not in stdout
+    assert "Exact match on 8 test molecules" in stdout
+    assert "checkpoint-2\t" in stdout and "checkpoint-3\t" in stdout
+    rows = read_tsv(progress_dir / "progress.tsv")
+    assert [row["model"] for row in rows] == ["checkpoint-2", "checkpoint-3"]
+    assert all(row["train_loss"] for row in rows)
+
+
+def test_checkpoint_progress_top_n(trained):
+    data_dir, output_dir, _ = trained
+    stdout = run([
+        "scripts/checkpoint_progress.py", str(output_dir), "--base-model", MODEL_NAME,
+        "--batch-size", "4", "--max-new-tokens", "16",
+        "--data-dir", str(data_dir), "--samples", "8", "--num-outputs", "2",
+    ])
+    assert "Top-1 to top-2 exact match (beam search) on 8 validation molecules" in stdout
+    progress_dir = output_dir / "progress" / "data_validation_top2"
+    rows = read_tsv(progress_dir / "progress.tsv")
+    assert [row["model"] for row in rows] == ["checkpoint-2", "checkpoint-3"]
+    assert all(float(row["top_2"]) >= float(row["exact_match"]) for row in rows)
+    assert len((progress_dir / "checkpoint-3_predictions.txt").read_text().splitlines()) == 16
+
+
+def test_loss_curve_written(trained):
+    _, output_dir, _ = trained
+    stdout = run(["scripts/loss_curve.py", str(output_dir)])
+    assert "Saved to:" in stdout
+    rows = read_tsv(output_dir / "loss_curve.tsv")
+    assert [row["step"] for row in rows] == ["1", "2", "3"]
+    assert all(row["loss"] for row in rows)
 
 
 def test_evaluation_results_go_to_output_dir(trained, tmp_path):

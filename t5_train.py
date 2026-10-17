@@ -9,6 +9,7 @@ PARALLEL_MODE chooses ddp, fsdp or hsdp.
 import gc
 import json
 import os
+import shutil
 import signal
 import sys
 import time
@@ -108,6 +109,57 @@ class StopBeforeTimeLimit(TrainerCallback):
         if self.stopped:
             control.should_evaluate = False
             control.should_save = False
+
+
+class KeepEpochCheckpoints(TrainerCallback):
+    """Keep the checkpoint saved at the end of every epoch (SAVE_STRATEGY=epoch).
+
+    save_total_limit would also count the checkpoints jobs save before their
+    time limit and delete epoch checkpoints to make room. Instead the Trainer
+    keeps every checkpoint, and after each save this:
+    - deletes time-limit (mid-epoch) checkpoints once a newer one exists;
+    - removes the optimizer state from epoch checkpoints older than the
+      newest two, which are kept whole to resume from. ./submit.sh progress
+      needs only the model weights.
+    """
+
+    def on_save(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        checkpoints = sorted(
+            (
+                path
+                for path in Path(args.output_dir).glob("checkpoint-*")
+                if path.name.split("-")[-1].isdigit()
+            ),
+            key=lambda path: int(path.name.split("-")[-1]),
+        )
+        # The newest checkpoint is the one just saved, the one to resume from.
+        for checkpoint in checkpoints[:-1]:
+            if not saved_at_epoch_end(checkpoint):
+                shutil.rmtree(checkpoint, ignore_errors=True)
+        kept = [path for path in checkpoints if path.exists()]
+        for checkpoint in kept[:-2]:
+            remove_optimizer_state(checkpoint)
+
+
+def saved_at_epoch_end(checkpoint: Path) -> bool:
+    """The Trainer's epoch is a whole number exactly at the end of an epoch."""
+    state_path = checkpoint / "trainer_state.json"
+    if not state_path.is_file():
+        # Never finished saving; it can't be resumed or scored.
+        return False
+    epoch = json.loads(state_path.read_text()).get("epoch") or 0
+    return abs(epoch - round(epoch)) < 1e-6 and epoch > 0
+
+
+def remove_optimizer_state(checkpoint: Path) -> None:
+    """Delete optimizer.pt / optimizer.bin (DDP) and optimizer_*/ (FSDP)."""
+    for path in checkpoint.glob("optimizer*"):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
 
 
 def save_metrics_file(output_dir: Path, split: str, metrics: dict) -> None:
@@ -221,9 +273,10 @@ def build_training_args(config: TrainConfig, use_bf16: bool) -> Seq2SeqTrainingA
         eval_strategy="epoch",
         save_strategy=config.save_strategy,
         save_steps=config.save_steps,
-        save_total_limit=config.save_total_limit,
+        # With per-epoch saving, KeepEpochCheckpoints decides what to keep.
+        save_total_limit=None if config.save_strategy == "epoch" else config.save_total_limit,
         logging_strategy="steps",
-        logging_steps=500,
+        logging_steps=config.logging_steps,
         learning_rate=config.effective_learning_rate,
         # A value below 1 is a share of the total training steps.
         warmup_steps=config.warmup_ratio,
@@ -333,6 +386,9 @@ def main() -> None:
     # Without a Slurm time limit (job_end_time 0) it only reacts to SIGUSR1.
     deadline = config.job_end_time - 60 * config.stop_margin_minutes
     stopper = StopBeforeTimeLimit(deadline if config.job_end_time > 0 else 0, device)
+    callbacks = [stopper]
+    if config.save_strategy == "epoch":
+        callbacks.append(KeepEpochCheckpoints())
 
     trainer = Seq2SeqTrainer(
         model=model,
@@ -341,7 +397,7 @@ def main() -> None:
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         data_collator=data_collator,
-        callbacks=[stopper],
+        callbacks=callbacks,
     )
 
     if config.is_main_process:

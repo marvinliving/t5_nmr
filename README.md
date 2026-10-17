@@ -65,7 +65,7 @@ Pick a run from `configs/train/` and submit it:
 2. Tokenizes the training and validation data once and caches it in `outputs/<run>/tokenized/`. Resubmitted jobs reuse the cache.
 3. Writes the complete configuration to `outputs/<run>/run_config.json`.
 4. Fine-tunes the model, measuring validation loss on the first 5,000 validation molecules after each epoch.
-5. Saves a checkpoint every 2,000 steps to `outputs/<run>/checkpoint-*`, keeping the latest two.
+5. Saves a checkpoint every 2,000 steps to `outputs/<run>/checkpoint-*`, keeping the latest two. With `SAVE_STRATEGY=epoch` it saves one at the end of every epoch instead and keeps all of them, older ones without their optimizer state (see *Which checkpoints there are to score* below).
 6. Saves the finished model to `outputs/<run>/final_model`.
 7. Scores exact match on the first 1,000 test molecules as a quick check, saved to `outputs/<run>/test_results.json`. This is not the official score; that comes from step 3.
 
@@ -79,26 +79,43 @@ A multi-GPU run can only resume on the same number of GPUs, with the same `PARAL
 
 A smoke test writes to its own folder, `outputs/<run>_max50steps`, so the real run never resumes from its checkpoints.
 
-**Is it still improving?** To decide whether a run needs more training, score its saved models on validation molecules:
+**Is it still improving?** To tell whether a run has finished learning, has levelled off or has overtrained, score every saved model on the external test set:
 
-    ./submit.sh progress xl_4x1x4_10ep
+    ./submit.sh progress <run> [--samples N] [--top N]
 
-This one-GPU job scores greedy top-1 exact match on the first 2,000 validation molecules (`PROGRESS_SAMPLES`) for every `checkpoint-*` in the run's folder and for `final_model`. It prints a table with each one's epoch, step, validation loss and exact match, and the change from the one before:
+The job runs on one node with 4 GPUs (`PROGRESS_GPUS`), and each GPU scores its own share of the run's `checkpoint-*` folders and `final_model`. By default it scores greedy top-1 exact match on the first 1,000 test molecules of `nmr_expt_data` (`PROGRESS_DATA_DIR` in `slurm/env.sh`). `--top 10` uses beam search and scores top-1 to top-10, and `--samples 0` scores every molecule, for example `./submit.sh progress xxl_4x1x4_10ep --samples 5000 --top 10`. Each GPU writes its own log, `logs/progress_<run>_<job>_gpu<n>.out`. Once they finish, `logs/progress_<run>_<job>.out` ends with the table of every model scored so far, with each one's epoch, step, training loss, validation loss and exact match, and the change in exact match from the row before:
 
-    model           epoch  step   eval_loss  exact_match  samples  change
-    checkpoint-<N>  1.0    <N>    <loss>     <score>      2000
-    checkpoint-<M>  2.0    <M>    <loss>     <score>      2000     <difference>
+    model           epoch  step   train_loss  eval_loss  exact_match  samples  change
+    checkpoint-<N>  1.0    <N>    <loss>      <loss>     <score>      1000
+    checkpoint-<M>  2.0    <M>    <loss>      <loss>     <score>      1000     <difference>
 
-If exact match is still rising between the last checkpoints, more epochs would probably help; if it has levelled off, they won't. The validation loss is only shown for checkpoints saved at the end of an epoch, where it is measured. By default it uses validation molecules, so the test set stays unused until the final evaluation.
+`train_loss` is the mean training loss logged over the epoch that ends at that model. `eval_loss` is the validation loss on the first 5,000 validation molecules of the run's own dataset, measured at the end of each epoch, so a checkpoint saved mid-epoch has none. With `--top N`, columns `top_2` to `top_N` follow `exact_match`.
 
-To follow the score on an external test set instead, such as the experimental spectra in `nmr_expt_data`, name the dataset and split, and how many molecules to score (`0` scores all of them):
+Reading it:
 
-    EVAL_DATA_DIR=/projects/b5an/nmr_expt_data PROGRESS_SPLIT=test PROGRESS_SAMPLES=5000 ./submit.sh progress xl_4x1x4_10ep
-    EVAL_DATA_DIR=/projects/b5an/nmr_expt_data PROGRESS_SPLIT=test PROGRESS_SAMPLES=0 ./submit.sh progress xl_4x1x4_10ep
+- Exact match still rising from epoch to epoch: the model is still learning, and more epochs would probably help.
+- Levelled off: training has plateaued.
+- Falling while `train_loss` keeps falling: the model has overtrained, so prefer an earlier epoch.
 
-Scores are saved to `outputs/<run>/progress/<dataset>_<split>/`, for example `progress/nmr_expt_data_test/`: one JSON file and one predictions file per model, plus `progress.tsv` with the table. Each dataset and split keeps its own scores and table. A score is kept after training deletes its checkpoint (`SAVE_TOTAL_LIMIT` keeps only the latest two), and a later job only scores models it hasn't scored yet. So submitting the job after each epoch, while training goes on, builds the whole curve. It reads checkpoints from `ddp` and `fsdp` runs alike: an FSDP checkpoint, stored as one shard per GPU, is loaded into a single model on one GPU. A checkpoint deleted by training while the job reads it is skipped.
+With 1,000 molecules, a top-1 difference of a couple of points between neighbouring epochs can be chance. Use `--samples 5000` or more to confirm a plateau.
 
-Predictions are written as they are made, so if the job reaches its time limit (`PROGRESS_TIME`, 4 hours), submit it again: it continues the interrupted model where it stopped. Scoring all 61,776 test molecules of `nmr_expt_data` for several checkpoints can take more than one job.
+If these scores are used to choose which epoch to report, the test score becomes optimistic. `nmr_expt_data` also has a validation split; `PROGRESS_SPLIT=validation` scores that and keeps the test set for the final evaluation. To score the run's own validation set instead, as this job used to by default:
+
+    EVAL_DATA_DIR=/projects/b5an/alberts_2d PROGRESS_SPLIT=validation ./submit.sh progress <run>
+
+Scores are saved to `outputs/<run>/progress/<dataset>_<split>/`, for example `progress/nmr_expt_data_test/`, or to `progress/<dataset>_<split>_top<N>/` for `--top N` above 1, so a top-10 job never replaces the top-1 scores. Each folder holds one JSON file and one predictions file per model, plus `progress.tsv` with the table. A later job only scores models it hasn't scored yet, and shares only those out between the GPUs; a different `--samples` scores the models again and replaces their scores. It reads checkpoints from `ddp` and `fsdp` runs alike: an FSDP checkpoint, stored as one shard per GPU, is loaded into a single model on one GPU. A checkpoint deleted by training while the job reads it is skipped.
+
+Predictions are written as they are made, so if the job reaches its time limit (`PROGRESS_TIME`, 4 hours), submit it again: it continues the interrupted models where they stopped. Scoring all 61,776 test molecules of `nmr_expt_data` for every checkpoint can take more than one job.
+
+**Which checkpoints there are to score.** With `SAVE_STRATEGY=epoch`, the checkpoint saved at the end of every epoch is kept, so a 10-epoch run has 10. The newest two are kept whole, to resume from; older ones lose their optimizer state, which scoring doesn't need. The checkpoints jobs save before their time limit are deleted once a newer one exists. For XXL, 10 epochs take about 620 GB: 8 checkpoints of about 44 GB and 2 of about 135 GB. A run resumed with this behaviour keeps its epochs from then on; epochs that `SAVE_TOTAL_LIMIT` deleted earlier can't come back. With `SAVE_STRATEGY=steps`, only the newest `SAVE_TOTAL_LIMIT` checkpoints exist. A score is kept after training deletes its checkpoint, though, so submitting the job after each epoch, while training goes on, builds the whole curve.
+
+**Loss curve.** The training and validation loss of a run, without a GPU:
+
+    python scripts/loss_curve.py outputs/<run>
+
+The Trainer logs the training loss every `LOGGING_STEPS` updates (500; the mean since the previous log) and the validation loss at the end of every epoch, and keeps both, at full precision, in the `trainer_state.json` saved with every checkpoint and at the end of training. The script merges those files, writes `outputs/<run>/loss_curve.tsv` with one row per logged step (step, epoch, loss, eval_loss, learning rate, gradient norm), and prints each epoch's mean training loss and validation loss. The progress job runs it too. Only the jobs that led to a saved checkpoint count, so losses from failed jobs never appear, and losses logged since a running run's newest checkpoint aren't saved yet.
+
+The training loss falls throughout. If `eval_loss` stops falling or rises while the training loss keeps falling, the model is fitting the training set more than it is learning something that carries over. The external exact match from `progress` then shows whether that matters on real spectra.
 
 ### 3. Evaluate the model on the full test set
 
@@ -234,9 +251,10 @@ A config sets any of these. Variables that a config doesn't set can also be give
 | `TARGET_MAX_LENGTH` | 640 | SMILES strings longer than this many tokens are cut off |
 | `EVAL_BATCH_SIZE` | 4 × `PER_GPU_BATCH` | Batch size for validation loss |
 | `EVAL_MAX_SAMPLES` | 5000 | Validation molecules (the first ones) used for validation loss; 0 uses all 35,749 |
+| `LOGGING_STEPS` | 500 | Updates between training-loss entries in the log and `trainer_state.json`: the spacing of the training-loss curve |
 | `GROUP_BY_LENGTH` | 0 | 1 batches spectra of similar length together (see [Performance](#performance-and-comparability)) |
 | `DATALOADER_NUM_WORKERS` | 4 on 1 GPU, 8 on several | Worker processes per GPU that prepare batches; also used to tokenize the data |
-| `SAVE_STEPS` / `SAVE_TOTAL_LIMIT` | 2000 / 2 | Checkpoint frequency and how many to keep |
+| `SAVE_STEPS` / `SAVE_TOTAL_LIMIT` | 2000 / 2 | Checkpoint frequency and how many to keep. `SAVE_TOTAL_LIMIT` applies to `SAVE_STRATEGY=steps`; `epoch` keeps every epoch |
 | `SAVE_STRATEGY` | steps | `epoch` saves at the end of every epoch instead of every `SAVE_STEPS` updates |
 | `STOP_MARGIN_MINUTES` | 20 | Save and stop this long before the job's time limit |
 | `TEST_SAMPLE_SIZE` | 1000 | Test molecules in the quick end-of-training check |
@@ -259,14 +277,18 @@ NMR inputs are never truncated. T5 has no fixed maximum input length, so the who
 | `MAX_RESUBMITS` | 20 | How many times an unfinished run submits itself again |
 | `EVAL_CHUNKS` | 1 | Evaluation array tasks, one node each |
 | `EVAL_GPUS` | 4 | GPUs per evaluation array task, each evaluating its own chunk; the split is cut into `EVAL_CHUNKS` × `EVAL_GPUS` chunks. Above 1, a task takes the node's memory (`EVAL_MEM` 0) |
-| `EVAL_DATA_DIR` | the run's `DATA_DIR` | Dataset that `evaluate`, `check` and `progress` use, for example an external test set. Results on another dataset go to `outputs/<run>/eval_<dataset>/` (`progress/<dataset>_<split>/` for `progress`) |
+| `EVAL_DATA_DIR` | the run's `DATA_DIR`; `PROGRESS_DATA_DIR` for `progress` | Dataset that `evaluate`, `check` and `progress` use, for example an external test set. Results on another dataset go to `outputs/<run>/eval_<dataset>/` (`progress/<dataset>_<split>/` for `progress`) |
 | `EVAL_MAX_ROWS` | 0 | Evaluate only the first rows of the split, for example 20000; 0 evaluates all of it |
 | `EVAL_TIME` / `EVAL_MEM` | `10:00:00` / `64G` | Time limit and host memory of each evaluation chunk |
 | `EVAL_GENERATION_BATCH_SIZE` | 16 | Spectra per `generate` call in the evaluation |
 | `NUM_OUTPUTS` | 10 | Candidate SMILES per spectrum in the evaluation |
 | `EVAL_SPLIT` | `test` | `test` or `validation` |
-| `PROGRESS_SPLIT` | `validation` | Split that `./submit.sh progress` scores: `validation` or `test` |
-| `PROGRESS_SAMPLES` | 2000 | Molecules (the first ones of the split) that `./submit.sh progress` scores each model on; 0 uses all |
+| `PROGRESS_DATA_DIR` | `/projects/b5an/nmr_expt_data` (from `slurm/env.sh`) | Dataset that `./submit.sh progress` scores unless `EVAL_DATA_DIR` is given |
+| `PROGRESS_SPLIT` | `test` | Split that `./submit.sh progress` scores: `validation` or `test` |
+| `PROGRESS_SAMPLES` | 1000 | Molecules (the first ones of the split) that `./submit.sh progress` scores each model on; 0 uses all. `--samples` overrides it |
+| `PROGRESS_TOP` | 1 | Candidate SMILES per spectrum in `./submit.sh progress`: 1 is greedy top-1, more is beam search scored top-1 to top-N. `--top` overrides it |
+| `PROGRESS_GPUS` | 4 | GPUs of the progress job's one node, each scoring its own share of the checkpoints. 1 runs on one GPU |
+| `PROGRESS_MEM` | whole node; `64G` with `PROGRESS_GPUS=1` | Host memory of the progress job |
 | `PROGRESS_TIME` | `04:00:00` | Time limit of the progress job. Submitted again, it carries on where it stopped |
 | `VALID_TIME` | `02:00:00` | Time limit of `./submit.sh valid` |
 
@@ -300,7 +322,7 @@ All three are the same optimization as a single-GPU run for the same global batc
 
 If `xxl_2x2x4_10ep` runs out of GPU memory, use `xxl_1x4x4_10ep`.
 
-**Checkpoints.** A job can only resume a checkpoint written with the same number of GPUs, `PARALLEL_MODE`, global batch and learning rate. `run_config.json` records them, and a job that doesn't match stops with a message saying what differs. An FSDP or HSDP checkpoint is stored as one shard per GPU. The final model is gathered into a normal Hugging Face model in `final_model/`, which loads on any number of GPUs. For XXL, each checkpoint takes about 135 GB, because it includes the optimizer state. With `SAVE_TOTAL_LIMIT=2` and the 45 GB final model, one XXL run needs about 315 GB of project storage.
+**Checkpoints.** A job can only resume a checkpoint written with the same number of GPUs, `PARALLEL_MODE`, global batch and learning rate. `run_config.json` records them, and a job that doesn't match stops with a message saying what differs. An FSDP or HSDP checkpoint is stored as one shard per GPU. The final model is gathered into a normal Hugging Face model in `final_model/`, which loads on any number of GPUs. For XXL, each checkpoint takes about 135 GB, because it includes the optimizer state. With `SAVE_TOTAL_LIMIT=2` and the 45 GB final model, one XXL run needs about 315 GB of project storage. With `SAVE_STRATEGY=epoch`, which keeps every epoch's checkpoint, a 10-epoch XXL run needs about 665 GB with the final model.
 
 **Host memory.** Multi-GPU jobs request the whole node's memory (`--mem=0`). Rank 0 loads the fp32 XXL weights (45 GB) and gathers the full model when saving, and the other processes wait. The tokenized dataset is memory-mapped, so all processes on a node share one copy. If your partition doesn't allow `--mem=0`, set `TRAIN_MEM=360G`.
 
@@ -407,8 +429,8 @@ Rows added by `scripts/combine_results.py` are named after the run. Older rows a
 
     pytest tests/
 
-- `tests/test_units.py` checks the evaluation bookkeeping (resume, chunk tiling, summary rows) and the training setup in about a minute. One test trains a tiny model under FSDP on two CPU processes, saves a sharded checkpoint, and checks that `checkpoint_progress.py` loads exactly those weights.
-- `tests/test_smoke.py` trains `google/flan-t5-small` for 3 steps on CPU on a tiny synthetic dataset. It then evaluates, resumes an interrupted evaluation, combines the chunks, and scores the checkpoints with `checkpoint_progress.py`, on its own validation set and on all of a second, external dataset, including resuming an interrupted scoring. It downloads the model on first use and takes a few minutes.
+- `tests/test_units.py` checks the evaluation bookkeeping (resume, chunk tiling, summary rows), the loss history, which checkpoints `SAVE_STRATEGY=epoch` keeps, and the training setup in about a minute. One test trains a tiny model under FSDP on two CPU processes, saves a sharded checkpoint, and checks that `checkpoint_progress.py` loads exactly those weights.
+- `tests/test_smoke.py` trains `google/flan-t5-small` for 3 steps on CPU on a tiny synthetic dataset. It then evaluates, resumes an interrupted evaluation, combines the chunks, and scores the checkpoints with `checkpoint_progress.py`, on its own validation set and on all of a second, external dataset, including resuming an interrupted scoring, sharing the checkpoints between two tasks and top-2 beam search. It also writes the loss curve with `loss_curve.py`. It downloads the model on first use and takes a few minutes.
 
 GitHub Actions runs both on every push (`.github/workflows/smoke.yml`). `python tests/make_tiny_dataset.py` writes the tiny dataset to `tmp/tiny/` for trying things by hand.
 
@@ -418,13 +440,15 @@ GitHub Actions runs both on every push (`.github/workflows/smoke.yml`). `python 
     config.py                    training configuration from environment variables
     nmr_data.py                  data loading and tokenization
     evaluate_exact_match.py      evaluation program (also used for the quick test)
-    submit.sh                    submits training, evaluation, check and progress jobs
+    submit.sh                    submits training, evaluation, check, progress and valid jobs
     configs/train/*.env          one file per run
     configs/template.env         every setting at its default
     slurm/env.sh                 cluster-specific settings
     slurm/*.sbatch               Slurm job templates
     scripts/combine_results.py   combines evaluation chunks
-    scripts/checkpoint_progress.py  exact match of every checkpoint, on any dataset
+    scripts/checkpoint_progress.py  top-1 to top-N exact match of every checkpoint, on any
+                                 dataset, the checkpoints shared out between GPUs
+    scripts/loss_curve.py        training and validation loss from trainer_state.json
     scripts/dataset_stats.py     token-length and tokenizer statistics
     scripts/check_target_lengths.py  SMILES longer than the token limits
     scripts/scaling_table.py     throughput and scaling efficiency across node counts

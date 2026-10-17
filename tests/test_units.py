@@ -326,9 +326,12 @@ def test_fsdp_checkpoint_loads_into_one_model(tiny_flan_t5, tmp_path):
     assert torch.equal(model.lm_head.weight, expected["lm_head.weight"].to(torch.bfloat16))
 
 
-def write_trainer_state(path: Path, step: int, epoch: float, eval_losses: dict) -> None:
+def write_trainer_state(
+    path: Path, step: int, epoch: float, eval_losses: dict, train_losses: dict | None = None
+) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    log = [{"step": s, "epoch": s / 10, "eval_loss": loss} for s, loss in eval_losses.items()]
+    log = [{"step": s, "epoch": s / 10, "loss": loss} for s, loss in (train_losses or {}).items()]
+    log += [{"step": s, "epoch": s / 10, "eval_loss": loss} for s, loss in eval_losses.items()]
     (path / "trainer_state.json").write_text(
         json.dumps({"global_step": step, "epoch": epoch, "log_history": log})
     )
@@ -366,6 +369,112 @@ def test_progress_finds_complete_checkpoints_in_step_order(tmp_path):
     # A checkpoint saved mid-epoch has no loss of its own.
     write_trainer_state(tmp_path / "checkpoint-25", 25, 2.5, {10: 0.9, 20: 0.7})
     assert training_progress(tmp_path / "checkpoint-25", tmp_path, {})["eval_loss"] is None
+
+
+def test_read_history_merges_checkpoint_histories(tmp_path):
+    from loss_curve import read_history
+
+    write_trainer_state(tmp_path / "checkpoint-10", 10, 1.0, {10: 0.9}, {5: 2.0, 10: 1.5})
+    write_trainer_state(
+        tmp_path / "checkpoint-20", 20, 2.0, {10: 0.9}, {5: 2.0, 10: 1.5, 15: 1.2, 20: 1.0}
+    )
+    # Written at the end of training, after the last evaluation.
+    write_trainer_state(tmp_path, 20, 2.0, {20: 0.7})
+    # Still being written.
+    (tmp_path / "checkpoint-30").mkdir()
+    (tmp_path / "checkpoint-30" / "trainer_state.json").write_text('{"global_step": 30, "log_hi')
+
+    history = read_history(tmp_path)
+    assert [(entry["step"], "loss" if "loss" in entry else "eval_loss") for entry in history] == [
+        (5, "loss"), (10, "eval_loss"), (10, "loss"), (15, "loss"), (20, "eval_loss"), (20, "loss"),
+    ]
+
+
+def test_mean_train_loss_averages_the_epoch():
+    from loss_curve import mean_train_loss
+
+    # Epochs are step / 10, as in write_trainer_state.
+    losses = {5: 4.0, 10: 3.0, 15: 2.0, 20: 1.0}
+    history = [{"step": s, "epoch": s / 10, "loss": loss} for s, loss in losses.items()]
+    history.append({"step": 20, "epoch": 2.0, "eval_loss": 9.0})
+    assert mean_train_loss(history, 2.0) == pytest.approx(1.5)
+    assert mean_train_loss(history, 1.0) == pytest.approx(3.5)
+    assert mean_train_loss(history, 5.0) is None
+
+
+def write_checkpoint(output_dir: Path, step: int, epoch: float, saved: bool = True) -> Path:
+    """A checkpoint with model weights and DDP- and FSDP-style optimizer state."""
+    path = output_dir / f"checkpoint-{step}"
+    (path / "optimizer_0").mkdir(parents=True)
+    (path / "optimizer_0" / "shard").write_text("")
+    (path / "optimizer.pt").write_text("")
+    (path / "model.safetensors").write_text("")
+    if saved:
+        (path / "trainer_state.json").write_text(json.dumps({"global_step": step, "epoch": epoch}))
+    return path
+
+
+WHOLE = ["model.safetensors", "optimizer.pt", "optimizer_0", "trainer_state.json"]
+SLIM = ["model.safetensors", "trainer_state.json"]
+
+
+def test_keep_epoch_checkpoints(tmp_path):
+    from types import SimpleNamespace
+
+    from transformers import TrainerControl, TrainerState
+
+    from t5_train import KeepEpochCheckpoints
+
+    def files(step):
+        return sorted(path.name for path in (tmp_path / f"checkpoint-{step}").iterdir())
+
+    args = SimpleNamespace(output_dir=str(tmp_path))
+    keep = KeepEpochCheckpoints()
+    for step, epoch in [(100, 1.0), (140, 1.4), (200, 2.0), (270, 2.7)]:
+        write_checkpoint(tmp_path, step, epoch)
+    keep.on_save(args, TrainerState(), TrainerControl())
+    # The time-limit checkpoint is gone once a newer one exists; the newest
+    # two are whole; older epochs keep only what scoring needs.
+    assert not (tmp_path / "checkpoint-140").exists()
+    assert files(200) == WHOLE and files(270) == WHOLE
+    assert files(100) == SLIM
+
+    # The next epoch ends: the time-limit checkpoint 270 goes, and so does a
+    # checkpoint that a crash left half saved.
+    write_checkpoint(tmp_path, 280, 0, saved=False)
+    write_checkpoint(tmp_path, 300, 3.0)
+    keep.on_save(args, TrainerState(), TrainerControl())
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "checkpoint-100", "checkpoint-200", "checkpoint-300",
+    ]
+    assert files(200) == WHOLE and files(300) == WHOLE
+    assert files(100) == SLIM
+
+    # Only world rank 0 deletes anything.
+    write_checkpoint(tmp_path, 350, 3.5)
+    write_checkpoint(tmp_path, 400, 4.0)
+    keep.on_save(args, TrainerState(is_world_process_zero=False), TrainerControl())
+    assert (tmp_path / "checkpoint-350").exists()
+    assert files(200) == WHOLE
+
+
+def test_progress_settings_from_before_top_n_count_as_top1():
+    from checkpoint_progress import same_settings
+
+    settings = {
+        "data_dir": "/data", "split": "test", "samples": 8, "max_new_tokens": 16,
+        "prefix": "p: ", "num_outputs": 1,
+    }
+    old_result = {key: value for key, value in settings.items() if key != "num_outputs"}
+    old_result.update(model="checkpoint-2", exact_match=0.5)
+    assert same_settings(old_result, settings)
+    assert not same_settings(old_result, {**settings, "num_outputs": 2})
+
+
+def test_logging_steps_read(monkeypatch):
+    monkeypatch.delenv("LOGGING_STEPS", raising=False)
+    assert make_config(monkeypatch).logging_steps == 500
+    assert make_config(monkeypatch, LOGGING_STEPS=1).logging_steps == 1
 
 
 @pytest.mark.parametrize(
