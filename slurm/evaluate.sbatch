@@ -69,6 +69,7 @@ evaluate_chunk() {
     --max-new-tokens "${GENERATION_MAX_NEW_TOKENS:-640}" \
     --start-index "$start" \
     --sample-size "$size" \
+    --smiles-spacing "${SMILES_SPACING:-auto}" \
     --resume \
     --local-files-only
 }

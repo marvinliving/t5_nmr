@@ -88,6 +88,12 @@ case "$job" in
       export EVAL_DATA_DIR="${EVAL_DATA_DIR:-$PROGRESS_DATA_DIR}"
     fi
     source slurm/load_run.sh
+    # How the run's model writes SMILES, for evaluate, check, progress and
+    # valid; checked here so a typo fails at submission.
+    case "${SMILES_SPACING:-auto}" in
+      auto|spaced|nospace) ;;
+      *) echo "SMILES_SPACING must be auto, spaced or nospace, got $SMILES_SPACING" >&2; exit 1 ;;
+    esac
     ;;
   *)
     usage

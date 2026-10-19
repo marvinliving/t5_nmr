@@ -240,3 +240,48 @@ def test_evaluation_results_go_to_output_dir(trained, tmp_path):
     ])
     assert (results_dir / "test_0_4_results.json").is_file()
     assert (results_dir / "test_0_4_predictions.txt").is_file()
+
+
+def spaced_copy(data_dir: Path, destination: Path) -> Path:
+    """The dataset with its SMILES as space-separated characters, as alberts_2d stores them."""
+    destination.mkdir(parents=True)
+    for path in data_dir.iterdir():
+        text = path.read_text()
+        if path.name.startswith("tgt-"):
+            text = "".join(" ".join(line) + "\n" for line in text.splitlines())
+        (destination / path.name).write_text(text)
+    return destination
+
+
+def test_no_space_model_scored_on_spaced_references(trained, tmp_path):
+    # The tiny dataset's SMILES have no spaces, so the model writes none.
+    data_dir, output_dir, _ = trained
+    spaced = spaced_copy(data_dir, tmp_path / "spaced")
+    results_dir = tmp_path / "results"
+    args = [
+        "evaluate_exact_match.py", "--model-path", str(output_dir / "final_model"),
+        "--data-dir", str(spaced), "--split", "test", "--batch-size", "4",
+        "--max-new-tokens", "16", "--sample-size", "8", "--output-dir", str(results_dir),
+    ]
+    stdout = run(args)
+    assert "SMILES: model nospace (from the training targets in" in stdout
+    assert "references spaced: compared without spaces" in stdout
+
+    # Give it the right answers, without spaces, and score them again.
+    targets = (data_dir / "tgt-test.txt").read_text().splitlines()[:8]
+    (results_dir / "test_0_8_predictions.txt").write_text("".join(t + "\n" for t in targets))
+    run([*args, "--resume"])
+    result = json.loads((results_dir / "test_0_8_results.json").read_text())
+    assert result["model_spacing"] == "nospace" and result["reference_spacing"] == "spaced"
+    assert result["ignore_spaces"] is True
+    assert result["exact_match"] == 1.0
+
+    # Progress follows the same rule and keeps these scores apart.
+    stdout = run([
+        "scripts/checkpoint_progress.py", str(output_dir), "--base-model", MODEL_NAME,
+        "--batch-size", "4", "--max-new-tokens", "16",
+        "--data-dir", str(spaced), "--split", "test", "--samples", "8",
+    ])
+    assert "spaces ignored =====" in stdout
+    progress_dir = output_dir / "progress" / "spaced_test"
+    assert json.loads((progress_dir / "checkpoint-3.json").read_text())["ignore_spaces"] is True

@@ -24,4 +24,5 @@ fi
 python scripts/valid_smiles.py "$predictions" \
   --data-dir "$EVAL_DATA_DIR" \
   --split "$EVAL_SPLIT" \
+  --smiles-spacing "${SMILES_SPACING:-auto}" \
   --workers "${SLURM_CPUS_PER_TASK:-0}"

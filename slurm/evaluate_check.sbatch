@@ -22,4 +22,5 @@ python evaluate_exact_match.py \
   --start-index 0 \
   --sample-size 10 \
   --output-file "$EVAL_RESULTS_DIR/test_check.json" \
+  --smiles-spacing "${SMILES_SPACING:-auto}" \
   --local-files-only

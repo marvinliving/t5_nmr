@@ -34,6 +34,7 @@ options=(
   --batch-size "${EVAL_GENERATION_BATCH_SIZE:-16}"
   --max-batch-tokens "${EVAL_MAX_BATCH_TOKENS:-100000}"
   --max-new-tokens "${GENERATION_MAX_NEW_TOKENS:-640}"
+  --smiles-spacing "${SMILES_SPACING:-auto}"
   --local-files-only
 )
 

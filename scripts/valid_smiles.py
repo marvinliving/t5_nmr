@@ -13,6 +13,10 @@ checks every candidate with RDKit. Reports:
 - valid_canonical: as valid_exact, but comparing RDKit canonical SMILES, so the
   same molecule written differently counts, and repeated molecules are dropped.
 
+If the predictions and the references write SMILES differently (as spaced
+tokens or not), raw_exact and valid_exact remove the spaces from both before
+comparing, as the evaluation does.
+
 Accuracies are over all spectra, as in reports/evaluation_summary.tsv. Results
 are printed and written as JSON next to the predictions. ./submit.sh valid
 <run> runs this on a whole node, one worker per core.
@@ -29,7 +33,14 @@ from typing import Dict, Iterable, List, Optional, Sequence
 REPO_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_DIR))
 
-from nmr_data import SPLIT_FILES, read_lines  # noqa: E402
+from nmr_data import (  # noqa: E402
+    SPACINGS,
+    SPLIT_FILES,
+    read_lines,
+    smiles_spacing,
+    spacing_rule,
+    without_spaces,
+)
 
 try:
     from rdkit import Chem, RDLogger
@@ -64,6 +75,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Processes for RDKit; 0 uses every CPU the job has, 1 runs without a pool",
+    )
+    parser.add_argument(
+        "--smiles-spacing",
+        choices=("auto", *SPACINGS),
+        default="auto",
+        help=(
+            "How the model wrote the predictions; auto reads it from them. If it "
+            "differs from the references, spaces are removed from both before "
+            "comparing."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -117,12 +138,20 @@ def group_candidates(lines: Sequence[str], targets: int, num_outputs: int = 0) -
     return [lines[i:i + num_outputs] for i in range(0, len(lines), num_outputs)]
 
 
-def count_match(top_n_matches: List[int], candidates: Sequence[str], target: str) -> None:
+def count_match(
+    top_n_matches: List[int],
+    candidates: Sequence[str],
+    target: str,
+    ignore_spaces: bool = False,
+) -> None:
     """Add one spectrum to top_n_matches[n - 1]: target in the first n candidates.
 
     The rule of evaluate_exact_match.count_match, repeated here so this
     CPU-only script doesn't import torch.
     """
+    if ignore_spaces:
+        target = without_spaces(target)
+        candidates = [without_spaces(candidate) for candidate in candidates]
     if target in candidates:
         for rank in range(list(candidates).index(target), len(top_n_matches)):
             top_n_matches[rank] += 1
@@ -136,8 +165,13 @@ def score(
     candidates_per_spectrum: Sequence[Sequence[str]],
     targets: Sequence[str],
     canonical_of: Dict[str, Optional[str]],
+    ignore_spaces: bool = False,
 ) -> Dict[str, object]:
-    """Validity and top-n exact match counts; canonical_of maps every SMILES."""
+    """Validity and top-n exact match counts; canonical_of maps every SMILES.
+
+    ignore_spaces applies to raw_exact and valid_exact; canonical SMILES
+    have no spaces either way.
+    """
     samples = len(targets)
     num_outputs = len(candidates_per_spectrum[0]) if samples else 0
     matches = {ranking: [0] * num_outputs for ranking in RANKINGS}
@@ -154,8 +188,8 @@ def score(
         valid_candidates += len(valid)
         any_valid += bool(valid)
 
-        count_match(matches["raw_exact"], list(candidates), target)
-        count_match(matches["valid_exact"], valid, target)
+        count_match(matches["raw_exact"], list(candidates), target, ignore_spaces)
+        count_match(matches["valid_exact"], valid, target, ignore_spaces)
         target_canonical = canonical_of[target]
         if target_canonical is None:
             invalid_targets += 1
@@ -221,16 +255,23 @@ def main() -> None:
         count = len(all_targets) - args.start_index
     targets = all_targets[args.start_index:args.start_index + count]
     candidates = group_candidates(lines, len(targets), args.num_outputs)
+    if args.smiles_spacing == "auto":
+        model_smiles, model_source = smiles_spacing(lines), "from the predictions"
+    else:
+        model_smiles, model_source = args.smiles_spacing, "set by SMILES_SPACING"
+    reference_smiles = smiles_spacing(targets)
+    ignore_spaces, spacing_line = spacing_rule(model_smiles, model_source, reference_smiles)
 
     # The CPUs Slurm gave the job; os.cpu_count() where affinity isn't available.
     available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
     workers = args.workers or available or 1
     print("Predictions:", args.predictions)
     print("References:", targets_path, f"from {args.start_index}")
-    print("Workers:", workers, flush=True)
+    print("Workers:", workers)
+    print(spacing_line, flush=True)
     canonical_of = canonicalize_all([*lines, *targets], workers)
 
-    result = score(candidates, targets, canonical_of)
+    result = score(candidates, targets, canonical_of, ignore_spaces)
     print_report(result)
 
     output = args.output or args.predictions.with_name(f"{args.predictions.stem}_valid.json")
@@ -238,6 +279,9 @@ def main() -> None:
         "predictions_file": str(args.predictions),
         "references_file": str(targets_path),
         "start_index": args.start_index,
+        "model_spacing": model_smiles,
+        "reference_spacing": reference_smiles,
+        "ignore_spaces": ignore_spaces,
         **result,
     }
     with output.open("w", encoding="utf-8") as handle:

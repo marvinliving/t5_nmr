@@ -12,7 +12,16 @@ from datasets import Dataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from nmr_data import DEFAULT_PREFIX, build_generation_collate, load_split
+from nmr_data import (
+    DEFAULT_PREFIX,
+    SPACINGS,
+    build_generation_collate,
+    load_split,
+    model_spacing,
+    spacing_rule,
+    target_spacing,
+    without_spaces,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -114,6 +123,16 @@ def parse_args() -> argparse.Namespace:
             "either way."
         ),
     )
+    parser.add_argument(
+        "--smiles-spacing",
+        choices=("auto", *SPACINGS),
+        default="auto",
+        help=(
+            "How the model writes SMILES. auto reads it from the training "
+            "targets named in the run's run_config.json. If it differs from "
+            "the references, spaces are removed from both before comparing."
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     return parser.parse_args()
 
@@ -203,8 +222,16 @@ def count_match(
     top_n_matches: List[int],
     candidates: Sequence[str],
     target: str,
+    ignore_spaces: bool = False,
 ) -> None:
-    """Add one spectrum to top_n_matches[n - 1]: target in the first n outputs."""
+    """Add one spectrum to top_n_matches[n - 1]: target in the first n outputs.
+
+    With ignore_spaces, spaces are removed from both first, for a model that
+    writes SMILES differently from the references (nmr_data.spacing_rule).
+    """
+    if ignore_spaces:
+        target = without_spaces(target)
+        candidates = [without_spaces(candidate) for candidate in candidates]
     if target in candidates:
         for rank in range(candidates.index(target), len(top_n_matches)):
             top_n_matches[rank] += 1
@@ -225,6 +252,7 @@ def run_evaluation(
     window_batches: int = 100,
     predictions_handle: Optional[TextIO] = None,
     on_window: Optional[Callable[[int, List[int]], None]] = None,
+    ignore_spaces: bool = False,
 ) -> List[int]:
     """Generate num_outputs SMILES per spectrum and count top-n exact matches.
 
@@ -236,6 +264,7 @@ def run_evaluation(
     over the cap still runs alone. Predictions are written to
     predictions_handle in dataset order at the end of each window, and
     on_window(processed, top_n_matches) is called after each write.
+    ignore_spaces is passed to count_match.
 
     Returns top_n_matches, where top_n_matches[n - 1] counts spectra whose
     reference is among the first n outputs.
@@ -334,7 +363,9 @@ def run_evaluation(
             targets = list(window["tgt"])
             for index in range(len(window)):
                 candidates = candidates_by_index[index]
-                count_match(top_n_matches, candidates, targets[index].strip())
+                count_match(
+                    top_n_matches, candidates, targets[index].strip(), ignore_spaces
+                )
                 if predictions_handle is not None:
                     predictions_handle.writelines(
                         candidate + "\n" for candidate in candidates
@@ -353,11 +384,13 @@ def resume_predictions(
     predictions_file: Path,
     targets: Sequence[str],
     num_outputs: int,
+    ignore_spaces: bool = False,
 ) -> Tuple[int, List[int]]:
     """Score the spectra already in predictions_file and return (count, matches).
 
     A job killed while writing can leave a spectrum with only some of its
     lines, or half a line; the file is cut back to the last whole spectrum.
+    ignore_spaces is passed to count_match.
     """
     top_n_matches = [0] * num_outputs
     if not predictions_file.is_file():
@@ -375,7 +408,7 @@ def resume_predictions(
 
     for index in range(done):
         candidates = kept[index * num_outputs:(index + 1) * num_outputs]
-        count_match(top_n_matches, candidates, targets[index].strip())
+        count_match(top_n_matches, candidates, targets[index].strip(), ignore_spaces)
     return done, top_n_matches
 
 
@@ -414,11 +447,30 @@ def main() -> None:
     )
     predictions_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Settled before anything is scored: a model trained on no-space SMILES
+    # would match none of a spaced test set's references, or the reverse.
+    run_dir = (
+        args.model_path
+        if (args.model_path / "run_config.json").is_file()
+        else args.model_path.parent
+    )
+    model_smiles, model_source = model_spacing(run_dir, args.smiles_spacing)
+    reference_smiles = target_spacing(args.data_dir, args.split)
+    ignore_spaces, spacing_line = spacing_rule(model_smiles, model_source, reference_smiles)
+    spacing = {
+        "model_spacing": model_smiles,
+        "reference_spacing": reference_smiles,
+        "ignore_spaces": ignore_spaces,
+    }
+
     resumed = 0
     resumed_matches = [0] * args.num_outputs
     if args.resume:
         resumed, resumed_matches = resume_predictions(
-            predictions_file, list(selected_dataset["tgt"]), args.num_outputs
+            predictions_file,
+            list(selected_dataset["tgt"]),
+            args.num_outputs,
+            ignore_spaces,
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -434,6 +486,7 @@ def main() -> None:
     print(f"Samples: {selected_count} / {total_count}", flush=True)
     print("Already done (resume):", resumed, flush=True)
     print("Outputs per spectrum:", args.num_outputs, flush=True)
+    print(spacing_line, flush=True)
     print("Batch size:", args.batch_size, flush=True)
     print("Max batch tokens:", args.max_batch_tokens or "no cap", flush=True)
     print("Sort by length:", args.sort_by_length, flush=True)
@@ -463,6 +516,7 @@ def main() -> None:
                 "exact_match": totals[0] / samples,
                 "top_n_matches": totals,
                 "top_n_exact_match": top_n_exact_match(totals, samples),
+                **spacing,
                 "elapsed_seconds": time.monotonic() - started_at,
             },
         )
@@ -497,6 +551,7 @@ def main() -> None:
                 window_batches=args.save_every,
                 predictions_handle=predictions_handle,
                 on_window=save_partial,
+                ignore_spaces=ignore_spaces,
             )
 
     top_n_matches = top_n_totals(new_matches)
@@ -515,6 +570,7 @@ def main() -> None:
         "exact_match": top_n_matches[0] / selected_count,
         "top_n_matches": top_n_matches,
         "top_n_exact_match": top_n_exact_match(top_n_matches, selected_count),
+        **spacing,
         "predictions_file": str(predictions_file.resolve()),
         "max_new_tokens": args.max_new_tokens,
         "batch_size": args.batch_size,

@@ -140,7 +140,14 @@ By default this is one job on one node with 4 GPUs. It splits the test molecules
 
 Set these like any other variable, either in the run's config or at submission, for example `NUM_OUTPUTS=1 ./submit.sh evaluate xl_4x4_10ep`.
 
-A prediction counts as correct only if it is **exactly** the same string as the reference SMILES.
+A prediction counts as correct only if it is **exactly** the same string as the reference SMILES, apart from spacing when the model and the test set write SMILES differently (below).
+
+**SMILES spacing.** `alberts_2d` and `nmr_expt_data` store SMILES as space-separated tokens (`C C ( = O ) O`). A copy made with `detokenize_smiles.py` stores them without spaces (`CC(=O)O`), and a model trained on it writes them that way. A model and a test set that write SMILES differently would match nothing, so before scoring, the evaluation works out both:
+
+- the model's from the training targets in the `data_dir` of the run's `run_config.json` (`SMILES_SPACING=spaced` or `nospace` in the config overrides this);
+- the test set's from its `tgt-*.txt`.
+
+If they agree, SMILES are compared as written. If they differ, or the model's can't be told, spaces are removed from both before comparing; spaces are never part of a SMILES, only of the tokenization. Each log says which near its top, for example `SMILES: model nospace (from the training targets in /projects/b5an/alberts_2d_nospace), references spaced: compared without spaces`, and the results record `model_spacing`, `reference_spacing` and `ignore_spaces`. So a no-space model can be scored on the spaced test sets as they are. `./submit.sh check`, `progress` and `valid` follow the same rule. Results scored before this compared as written; submitting the evaluation again re-scores every chunk from its predictions file in seconds, without generating again.
 
 To test a trained model on just 10 molecules first, run `./submit.sh check <run>`.
 
@@ -173,7 +180,7 @@ Each chunk's results record the size of the test set. Results from evaluations m
 
 Once the combine job has written `prd-test.txt`, this CPU job runs `scripts/valid_smiles.py` on it. It checks every candidate with RDKit and scores top-1 to top-N three ways:
 
-- `raw_exact`: exact match as the evaluation scores it. It should equal the run's row in `reports/evaluation_summary.tsv`.
+- `raw_exact`: exact match as the evaluation scores it, including its rule for [SMILES spacing](#3-evaluate-the-model-on-the-full-test-set); here the model's spacing is read from the predictions themselves. It should equal the run's row in `reports/evaluation_summary.tsv`.
 - `valid_exact`: exact match after dropping candidates RDKit can't parse, so the *n*-th valid candidate moves up to rank *n*.
 - `valid_canonical`: as `valid_exact`, but comparing RDKit canonical SMILES, so the same molecule written differently counts, and a molecule repeated among the candidates is kept only once.
 
@@ -283,6 +290,7 @@ NMR inputs are never truncated. T5 has no fixed maximum input length, so the who
 | `EVAL_GENERATION_BATCH_SIZE` | 16 | Spectra per `generate` call in the evaluation |
 | `NUM_OUTPUTS` | 10 | Candidate SMILES per spectrum in the evaluation |
 | `EVAL_SPLIT` | `test` | `test` or `validation` |
+| `SMILES_SPACING` | `auto` | How the run's model writes SMILES: `spaced`, `nospace`, or `auto` to read it from its training targets. When it differs from the test set's, `evaluate`, `check`, `progress` and `valid` compare without spaces (see [SMILES spacing](#3-evaluate-the-model-on-the-full-test-set)) |
 | `PROGRESS_DATA_DIR` | `/projects/b5an/nmr_expt_data` (from `slurm/env.sh`) | Dataset that `./submit.sh progress` scores unless `EVAL_DATA_DIR` is given |
 | `PROGRESS_SPLIT` | `test` | Split that `./submit.sh progress` scores: `validation` or `test` |
 | `PROGRESS_SAMPLES` | 1000 | Molecules (the first ones of the split) that `./submit.sh progress` scores each model on; 0 uses all. `--samples` overrides it |

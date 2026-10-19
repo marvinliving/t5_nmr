@@ -37,6 +37,66 @@ def test_resume_without_file_starts_at_zero(tmp_path):
     assert resume_predictions(tmp_path / "missing.txt", ["C"], 3) == (0, [0, 0, 0])
 
 
+def test_count_match_ignores_spaces_only_when_asked():
+    matches = [0, 0]
+    count_match(matches, ["CCN", "CC(=O)O"], "C C ( = O ) O")
+    assert matches == [0, 0]
+    count_match(matches, ["CCN", "CC(=O)O"], "C C ( = O ) O", ignore_spaces=True)
+    assert matches == [0, 1]
+    count_match(matches, ["C C N", "C"], "CCN", ignore_spaces=True)
+    assert matches == [1, 2]
+
+
+def test_resume_rescores_without_spaces(tmp_path):
+    # A no-space model's predictions against spaced references.
+    predictions = tmp_path / "predictions.txt"
+    predictions.write_text("CCO\nCCN\n")
+    targets = ["C C O", "C C C"]
+    assert resume_predictions(predictions, targets, 1) == (2, [0])
+    assert resume_predictions(predictions, targets, 1, ignore_spaces=True) == (2, [1])
+
+
+def test_smiles_spacing_by_majority():
+    from nmr_data import smiles_spacing
+
+    assert smiles_spacing(["C C O\n", "C\n", "C C ( = O ) O\n"]) == "spaced"
+    # A stray space is outvoted.
+    assert smiles_spacing(["CCO", "CC(=O)O", "C C"]) == "nospace"
+    assert smiles_spacing(["", "  \n"]) is None
+
+
+def test_spacing_rule_follows_the_model_and_the_references(tmp_path):
+    from nmr_data import model_spacing, spacing_rule
+
+    data_dir = tmp_path / "nospace"
+    data_dir.mkdir()
+    (data_dir / "tgt-train.txt").write_text("CCO\nCC(=O)O\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "run_config.json").write_text(json.dumps({"data_dir": str(data_dir)}))
+
+    model, source = model_spacing(run_dir)
+    assert model == "nospace" and str(data_dir) in source
+    assert model_spacing(run_dir, "spaced") == ("spaced", "set by SMILES_SPACING")
+    assert model_spacing(tmp_path)[0] is None  # no run_config.json
+
+    assert spacing_rule("nospace", source, "spaced")[0] is True
+    assert spacing_rule("spaced", source, "spaced")[0] is False
+    # Unknown: removing spaces is right either way.
+    ignore_spaces, line = spacing_rule(None, "no run_config.json", "spaced")
+    assert ignore_spaces and line.endswith("compared without spaces")
+
+
+def test_combine_refuses_chunks_scored_with_different_spacing_rules():
+    from combine_results import check_spacing_rule
+
+    # Results from before the rule was recorded compared as written.
+    assert check_spacing_rule([{"start_index": 0}, {"ignore_spaces": False}]) is False
+    assert check_spacing_rule([{"ignore_spaces": True}, {"ignore_spaces": True}]) is True
+    with pytest.raises(ValueError, match="re-scores"):
+        check_spacing_rule([{"ignore_spaces": True}, {}])
+
+
 def write_chunk(directory: Path, start: int, end: int, matches: list[int]) -> None:
     (directory / f"test_{start}_{end}_results.json").write_text(
         json.dumps(
@@ -469,6 +529,16 @@ def test_progress_settings_from_before_top_n_count_as_top1():
     old_result.update(model="checkpoint-2", exact_match=0.5)
     assert same_settings(old_result, settings)
     assert not same_settings(old_result, {**settings, "num_outputs": 2})
+
+
+def test_progress_results_from_before_spacing_compared_as_written():
+    from checkpoint_progress import same_settings
+
+    settings = {"split": "test", "samples": 8, "ignore_spaces": False}
+    old_result = {"split": "test", "samples": 8, "exact_match": 0.0}
+    assert same_settings(old_result, settings)
+    # A no-space run's old scores are redone with spaces ignored.
+    assert not same_settings(old_result, {**settings, "ignore_spaces": True})
 
 
 def test_logging_steps_read(monkeypatch):

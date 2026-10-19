@@ -13,7 +13,9 @@ own or another one; ./submit.sh progress (slurm/progress.sbatch) scores the
 test split of the external dataset, nmr_expt_data, by default.
 
 --num-outputs 1 is greedy top-1. A larger value uses beam search and scores
-top-1 to top-N, for example --num-outputs 10.
+top-1 to top-N, for example --num-outputs 10. If the run was trained on
+no-space SMILES and the dataset stores them as spaced tokens, or the reverse,
+spaces are removed before comparing (--smiles-spacing).
 
 FSDP checkpoints hold one shard per GPU; they are read straight into one
 model, so each model needs one GPU whatever the run trained on. With --task i
@@ -49,7 +51,14 @@ from evaluate_exact_match import (  # noqa: E402
     top_n_exact_match,
 )
 from loss_curve import eval_loss_at, mean_train_loss, read_history  # noqa: E402
-from nmr_data import DEFAULT_PREFIX, load_split  # noqa: E402
+from nmr_data import (  # noqa: E402
+    DEFAULT_PREFIX,
+    SPACINGS,
+    load_split,
+    model_spacing,
+    spacing_rule,
+    target_spacing,
+)
 from t5_train import final_model_is_complete, fix_t5_embeddings  # noqa: E402
 
 # Where accelerate saves an FSDP SHARDED_STATE_DICT checkpoint's model.
@@ -108,6 +117,16 @@ def parse_args() -> argparse.Namespace:
         "--table-only",
         action="store_true",
         help="Print and save the table of models already scored, without scoring",
+    )
+    parser.add_argument(
+        "--smiles-spacing",
+        choices=("auto", *SPACINGS),
+        default="auto",
+        help=(
+            "How the run's model writes SMILES. auto reads it from the training "
+            "targets named in its run_config.json. If it differs from the "
+            "references, spaces are removed from both before comparing."
+        ),
     )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args()
@@ -169,8 +188,12 @@ def training_progress(model_dir: Path, output_dir: Path, losses: dict[int, float
 
 
 def same_settings(result: dict, settings: dict) -> bool:
-    """result was scored with settings. Results from before --num-outputs are top-1."""
-    result = {"num_outputs": 1, **result}
+    """result was scored with settings.
+
+    Results from before --num-outputs are top-1, and those from before SMILES
+    spacing was checked compared the SMILES as written.
+    """
+    result = {"num_outputs": 1, "ignore_spaces": False, **result}
     return all(result.get(key) == value for key, value in settings.items())
 
 
@@ -268,7 +291,9 @@ def score_models(args: argparse.Namespace, progress_dir: Path, dataset, settings
         partial_path = progress_dir / f"{model_dir.name}.partial.json"
         done, matches = 0, [0] * args.num_outputs
         if partial_path.is_file() and same_settings(json.loads(partial_path.read_text()), settings):
-            done, matches = resume_predictions(predictions_path, targets, args.num_outputs)
+            done, matches = resume_predictions(
+                predictions_path, targets, args.num_outputs, settings["ignore_spaces"]
+            )
             print(f"Resuming after {done} of {len(dataset)} molecules")
         else:
             partial_path.write_text(json.dumps(settings, indent=2) + "\n")
@@ -286,6 +311,7 @@ def score_models(args: argparse.Namespace, progress_dir: Path, dataset, settings
                     num_outputs=args.num_outputs,
                     max_new_tokens=args.max_new_tokens,
                     predictions_handle=predictions,
+                    ignore_spaces=settings["ignore_spaces"],
                 )
                 matches = [old + added for old, added in zip(matches, new)]
         del model
@@ -355,9 +381,10 @@ def write_table(args: argparse.Namespace, progress_dir: Path, settings: dict) ->
         scored = "Exact match"
     else:
         scored = f"Top-1 to top-{num_outputs} exact match (beam search)"
+    spaces = ", spaces ignored" if settings["ignore_spaces"] else ""
     print(
         f"\n===== {scored} on {settings['samples']} {args.split} molecules "
-        f"of {args.data_dir} ====="
+        f"of {args.data_dir}{spaces} ====="
     )
     print_table(rows, columns)
     print("Saved to:", progress_dir / "progress.tsv")
@@ -375,6 +402,13 @@ def main() -> None:
     dataset = load_split(args.data_dir, args.split)
     if 0 < args.samples < len(dataset):
         dataset = dataset.select(range(args.samples))
+    # A model trained on no-space SMILES would match none of a spaced test
+    # set's references, or the reverse.
+    ignore_spaces, spacing_line = spacing_rule(
+        *model_spacing(args.output_dir, args.smiles_spacing),
+        target_spacing(args.data_dir, args.split),
+    )
+    print(spacing_line)
     settings = {
         "data_dir": str(args.data_dir.resolve()),
         "split": args.split,
@@ -382,6 +416,7 @@ def main() -> None:
         "max_new_tokens": args.max_new_tokens,
         "prefix": args.prefix,
         "num_outputs": args.num_outputs,
+        "ignore_spaces": ignore_spaces,
     }
 
     if not args.table_only:

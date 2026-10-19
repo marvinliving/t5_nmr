@@ -148,6 +148,21 @@ def chunk_predictions_file(chunk: dict) -> Path:
     return chunk["path"].with_name(name)
 
 
+def check_spacing_rule(chunks: list[dict]) -> bool:
+    """Whether the chunks compared SMILES without spaces; all must agree.
+
+    Results from before the rule was recorded compared them as written.
+    """
+    rules = {chunk.get("ignore_spaces", False) for chunk in chunks}
+    if len(rules) > 1:
+        raise ValueError(
+            "Some chunks compared SMILES without spaces and some as written. "
+            "Submit the evaluation again: it re-scores every chunk from its "
+            "predictions file."
+        )
+    return rules.pop()
+
+
 def combine_predictions(chunks: list[dict], destination: Path) -> None:
     with destination.open("w", encoding="utf-8") as output:
         for chunk in chunks:
@@ -188,6 +203,11 @@ def main() -> None:
     chunks = load_chunks(output_dir, args.split)
     total = split_total(args, chunks)
     check_tiling(chunks, total)
+    if check_spacing_rule(chunks):
+        print(
+            "SMILES compared without spaces: the model and the references "
+            "write them differently"
+        )
 
     num_outputs = min(len(chunk.get("top_n_matches", [0])) for chunk in chunks)
     top_n = [

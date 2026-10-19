@@ -15,9 +15,11 @@ sys.path.insert(0, str(REPO_DIR / "scripts"))
 from valid_smiles import canonical, canonicalize_all, group_candidates, score  # noqa: E402
 
 
-def score_lists(candidates, targets, workers=1):
+def score_lists(candidates, targets, workers=1, ignore_spaces=False):
     lines = [c for spectrum in candidates for c in spectrum]
-    return score(candidates, targets, canonicalize_all([*lines, *targets], workers))
+    return score(
+        candidates, targets, canonicalize_all([*lines, *targets], workers), ignore_spaces
+    )
 
 
 def test_canonical_rejects_invalid_smiles():
@@ -64,6 +66,16 @@ def test_reference_rdkit_cannot_parse_is_counted_not_dropped():
     assert result["top_n_exact_match"]["valid_canonical"]["top_1"] == 0.5
 
 
+def test_no_space_predictions_against_spaced_references():
+    candidates, targets = [["CC(=O)O", "N"]], ["C C ( = O ) O"]
+    as_written = score_lists(candidates, targets)
+    assert as_written["top_n_matches"]["raw_exact"] == [0, 0]
+    assert as_written["top_n_matches"]["valid_canonical"] == [1, 1]
+    without_spaces = score_lists(candidates, targets, ignore_spaces=True)
+    assert without_spaces["top_n_matches"]["raw_exact"] == [1, 1]
+    assert without_spaces["top_n_matches"]["valid_exact"] == [1, 1]
+
+
 def test_group_candidates_infers_outputs_and_rejects_bad_counts():
     assert group_candidates(["a", "b", "c", "d"], 2) == [["a", "b"], ["c", "d"]]
     with pytest.raises(ValueError):
@@ -93,3 +105,19 @@ def test_command_line_writes_json(tmp_path):
     assert result["num_outputs"] == 2
     assert result["top_n_matches"]["valid_exact"] == [1, 1]
     assert result["top_n_matches"]["valid_canonical"] == [2, 2]
+    assert result["ignore_spaces"] is False
+
+
+def test_command_line_detects_spacing_from_the_predictions(tmp_path):
+    (tmp_path / "tgt-test.txt").write_text("C C O\nC C N\n")
+    predictions = tmp_path / "prd-test.txt"
+    predictions.write_text("CCO\nCCC\n")
+    stdout = subprocess.run(
+        [sys.executable, str(REPO_DIR / "scripts" / "valid_smiles.py"), str(predictions),
+         "--data-dir", str(tmp_path), "--workers", "1"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert "model nospace (from the predictions), references spaced: compared without spaces" in stdout
+    result = json.loads((tmp_path / "prd-test_valid.json").read_text())
+    assert result["model_spacing"] == "nospace" and result["reference_spacing"] == "spaced"
+    assert result["top_n_matches"]["raw_exact"] == [1]
