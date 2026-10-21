@@ -571,3 +571,55 @@ def test_results_on_another_dataset_get_their_own_folder(eval_data_dir, results_
         cwd=REPO_DIR, env=env, capture_output=True, text=True, check=True,
     ).stdout
     assert output.strip() == results_dir
+
+
+def loaded(loader: str, env: dict, names: tuple) -> dict:
+    """The values of names after sourcing slurm/env.sh and then loader."""
+    import os
+    import subprocess
+
+    base = {
+        name: value for name, value in os.environ.items()
+        if name not in ("DATA_DIR", "EVAL_DATA_DIR", "OUTPUT_DIR", "MAX_STEPS", "RUN", "PREDICT")
+    }
+    script = f"source slurm/env.sh; source {loader}; " + "; ".join(
+        f'echo "${{{name}}}"' for name in names
+    )
+    output = subprocess.run(
+        ["bash", "-c", script], cwd=REPO_DIR, env={**base, **env},
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return dict(zip(names, output.splitlines()))
+
+
+def test_run_model_is_its_final_model():
+    values = loaded("slurm/load_run.sh", {"RUN": "xl_4x1x4_10ep"}, ("MODEL_PATH",))
+    assert values["MODEL_PATH"] == "outputs/xl_4x1x4_10ep/final_model"
+
+
+def test_prediction_loads_its_run_and_writes_next_to_the_data():
+    names = (
+        "RUN", "MODEL_PATH", "MODEL_LABEL", "MODEL_NAME", "EVAL_DATA_DIR",
+        "EVAL_RESULTS_DIR", "PREDICTIONS_FILE",
+    )
+    # A run, dataset and model left in the environment are ignored.
+    values = loaded(
+        "slurm/load_predict.sh",
+        {
+            "PREDICT": "xxl_4x1x4_10ep_on_nmr_expt_data",
+            "RUN": "xl_4x1x4_10ep",
+            "EVAL_DATA_DIR": "/elsewhere",
+            "MODEL_PATH": "/elsewhere/model",
+        },
+        names,
+    )
+    assert values == {
+        "RUN": "xxl_4x1x4_10ep",
+        "MODEL_PATH": "outputs/xxl_4x1x4_10ep/final_model",
+        "MODEL_LABEL": "xxl_4x1x4_10ep",
+        # From the run's config.
+        "MODEL_NAME": "google/flan-t5-xxl",
+        "EVAL_DATA_DIR": "/projects/b5an/nmr_expt_data",
+        "EVAL_RESULTS_DIR": "outputs/predict/xxl_4x1x4_10ep_on_nmr_expt_data",
+        "PREDICTIONS_FILE": "/projects/b5an/nmr_expt_data/prd-test_xxl_4x1x4_10ep.txt",
+    }

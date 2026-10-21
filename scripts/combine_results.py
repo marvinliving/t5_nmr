@@ -5,7 +5,8 @@
 Finds <output dir>/test_<start>_<end>_results.json for the run, checks that
 the chunks cover the whole split exactly once, prints top-1 to top-N exact
 match weighted by chunk size, joins the chunks' predictions into
-prd-test.txt, and records top-1 to top-N in reports/evaluation_summary.tsv.
+prd-test.txt (or --predictions), and records top-1 to top-N in
+reports/evaluation_summary.tsv.
 """
 
 import argparse
@@ -61,6 +62,11 @@ def parse_args() -> argparse.Namespace:
         "--total",
         type=int,
         help="Examples in the split, instead of reading it from the data",
+    )
+    parser.add_argument(
+        "--predictions",
+        type=Path,
+        help="Where to write the joined predictions; defaults to prd-<split>.txt in the output folder",
     )
     parser.add_argument(
         "--summary",
@@ -218,7 +224,7 @@ def main() -> None:
         print(f"top-{rank}: {matches / total:.4f}")
 
     file_split = "val" if args.split == "validation" else "test"
-    predictions = output_dir / f"prd-{file_split}.txt"
+    predictions = args.predictions or output_dir / f"prd-{file_split}.txt"
     if all(chunk_predictions_file(chunk).is_file() for chunk in chunks):
         combine_predictions(chunks, predictions)
         print("Predictions:", predictions)

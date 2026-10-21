@@ -16,6 +16,10 @@
 #   ./submit.sh valid <run> [--nodes N] [--gpus N] [sbatch options]
 #                                                 top-n exact match of the evaluated
 #                                                 predictions counting only valid SMILES
+#   ./submit.sh predict <name> [sbatch options]
+#                                                 evaluate, combine and valid for the run
+#                                                 and dataset in configs/predict/<name>.env;
+#                                                 the predictions go next to its spectra
 #   ./submit.sh test-gpu [sbatch options]         GPU and PyTorch check
 #   ./submit.sh test-multi-gpu [sbatch options]   NCCL check on 4 GPUs (--nodes=2 for two nodes)
 #   ./submit.sh check-lengths [sbatch options]    SMILES longer than the token limits (no GPU)
@@ -34,7 +38,7 @@ source slurm/env.sh
 mkdir -p logs
 
 usage() {
-  sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 1
 }
 
@@ -44,6 +48,29 @@ progress_only() {
     echo "$1 is only for ./submit.sh progress" >&2
     exit 1
   fi
+}
+
+# How the run's model writes SMILES, for evaluate, check, progress, valid and
+# predict; checked at submission so a typo fails there.
+check_smiles_spacing() {
+  case "${SMILES_SPACING:-auto}" in
+    auto|spaced|nospace) ;;
+    *) echo "SMILES_SPACING must be auto, spaced or nospace, got $SMILES_SPACING" >&2; exit 1 ;;
+  esac
+}
+
+# RDKit runs on CPUs only. A whole node bills the same as one core, so take
+# all of it: one worker per core.
+submit_valid() {
+  sbatch \
+    --job-name="valid_$label" \
+    --nodes=1 \
+    --ntasks-per-node=1 \
+    --cpus-per-task="$((CPUS_PER_GPU * 4))" \
+    --mem=0 \
+    --time="${VALID_TIME:-02:00:00}" \
+    --export=ALL \
+    "$@" slurm/valid_smiles.sbatch
 }
 
 [ $# -ge 1 ] || usage
@@ -64,6 +91,9 @@ case "$job" in
     [ $# -ge 1 ] || usage
     export RUN="$1"
     shift
+    # A PREDICT left in the environment would make the jobs load that
+    # prediction instead of the run.
+    unset PREDICT
     # Take --nodes, --gpus, --samples and --top out of the options; the rest
     # go to sbatch. Like --nodes and --gpus, --samples and --top are kept in
     # CLI_* variables so they win over the run's config.
@@ -88,12 +118,50 @@ case "$job" in
       export EVAL_DATA_DIR="${EVAL_DATA_DIR:-$PROGRESS_DATA_DIR}"
     fi
     source slurm/load_run.sh
-    # How the run's model writes SMILES, for evaluate, check, progress and
-    # valid; checked here so a typo fails at submission.
-    case "${SMILES_SPACING:-auto}" in
-      auto|spaced|nospace) ;;
-      *) echo "SMILES_SPACING must be auto, spaced or nospace, got $SMILES_SPACING" >&2; exit 1 ;;
+    label="$RUN"
+    check_smiles_spacing
+    ;;
+  predict)
+    [ $# -ge 1 ] || usage
+    export PREDICT="$1"
+    shift
+    for option in "$@"; do
+      case "$option" in
+        --nodes*|--gpus*)
+          echo "$option is not for ./submit.sh predict; for a run trained with it, set MODEL_PATH in configs/predict/$PREDICT.env" >&2
+          exit 1
+          ;;
+        --samples*|--top*) progress_only "$option" ;;
+      esac
+    done
+    source slurm/load_predict.sh
+    label="predict_$PREDICT"
+    # Checked here so a missing model or file fails at submission, not on a
+    # GPU node after waiting in the queue.
+    case "${EVAL_SPLIT:-test}" in
+      test|validation) ;;
+      *) echo "EVAL_SPLIT must be test or validation, got $EVAL_SPLIT" >&2; exit 1 ;;
     esac
+    if [ ! -f "$MODEL_PATH/config.json" ]; then
+      echo "No model in $MODEL_PATH (no config.json): train $RUN first, or set MODEL_PATH in $PREDICT_CONFIG." >&2
+      echo "FSDP checkpoints can't be loaded this way; use the run's final_model." >&2
+      exit 1
+    fi
+    if [ "${EVAL_SPLIT:-test}" = validation ]; then split_file=val; else split_file=test; fi
+    for file in "src-$split_file.txt" "tgt-$split_file.txt"; do
+      if [ ! -f "$EVAL_DATA_DIR/$file" ]; then
+        echo "No $EVAL_DATA_DIR/$file" >&2
+        exit 1
+      fi
+    done
+    if [ ! -w "$EVAL_DATA_DIR" ]; then
+      echo "Can't write the predictions to $EVAL_DATA_DIR" >&2
+      exit 1
+    fi
+    check_smiles_spacing
+    echo "Model: $MODEL_PATH"
+    echo "Data: $EVAL_DATA_DIR (${EVAL_SPLIT:-test} split)"
+    echo "Predictions: $PREDICTIONS_FILE"
     ;;
   *)
     usage
@@ -123,13 +191,13 @@ case "$job" in
       --export=ALL \
       "$@" slurm/train.sbatch
     ;;
-  evaluate)
+  evaluate|predict)
     chunks="${EVAL_CHUNKS:-1}"
     # Each array task evaluates EVAL_GPUS chunks at once, one per GPU.
     eval_gpus="${EVAL_GPUS:-4}"
     if [ "$eval_gpus" -gt 1 ]; then default_eval_mem=0; else default_eval_mem=64G; fi
     eval_job=$(sbatch --parsable \
-      --job-name="eval_$RUN" \
+      --job-name="eval_$label" \
       --array="0-$((chunks - 1))" \
       --nodes=1 \
       --ntasks-per-node="$eval_gpus" \
@@ -144,8 +212,8 @@ case "$job" in
     # Combines the chunks once all of them succeed. If a chunk fails, Slurm
     # cancels this job; submitting the evaluation again resumes the chunks
     # and submits a new one.
-    sbatch \
-      --job-name="combine_$RUN" \
+    combine_job=$(sbatch --parsable \
+      --job-name="combine_$label" \
       --dependency="afterok:$eval_job" \
       --kill-on-invalid-dep=yes \
       --nodes=1 \
@@ -154,20 +222,18 @@ case "$job" in
       --mem=16G \
       --time=00:30:00 \
       --export=ALL \
-      slurm/combine.sbatch
+      slurm/combine.sbatch)
+    combine_job="${combine_job%%;*}"
+    echo "Submitted combine job $combine_job"
+    # A prediction then checks its combined predictions with RDKit; Slurm
+    # cancels this too if the combine job fails.
+    if [ "$job" = predict ] && [ "${PREDICT_VALID:-1}" != 0 ]; then
+      valid_job=$(submit_valid --parsable --dependency="afterok:$combine_job" --kill-on-invalid-dep=yes)
+      echo "Submitted valid job ${valid_job%%;*}"
+    fi
     ;;
   valid)
-    # RDKit runs on CPUs only. A whole node bills the same as one core, so
-    # take all of it: one worker per core.
-    exec sbatch \
-      --job-name="valid_$RUN" \
-      --nodes=1 \
-      --ntasks-per-node=1 \
-      --cpus-per-task="$((CPUS_PER_GPU * 4))" \
-      --mem=0 \
-      --time="${VALID_TIME:-02:00:00}" \
-      --export=ALL \
-      "$@" slurm/valid_smiles.sbatch
+    submit_valid "$@"
     ;;
   check)
     exec sbatch \

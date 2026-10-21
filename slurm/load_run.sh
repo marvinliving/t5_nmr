@@ -48,6 +48,8 @@ if [ "${MAX_STEPS:-0}" -gt 0 ]; then
   OUTPUT_DIR="${OUTPUT_DIR}_max${MAX_STEPS}steps"
 fi
 export OUTPUT_DIR
+# The model evaluate scores.
+export MODEL_PATH="$OUTPUT_DIR/final_model"
 
 # Dataset that evaluate, check and progress score on: the run's own unless
 # EVAL_DATA_DIR is given, for example an external test set. Results on

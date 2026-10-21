@@ -242,6 +242,32 @@ def test_evaluation_results_go_to_output_dir(trained, tmp_path):
     assert (results_dir / "test_0_4_predictions.txt").is_file()
 
 
+def test_prediction_on_a_folder_with_only_a_test_split(trained, tmp_path):
+    # The steps of ./submit.sh predict: evaluate, combine next to the spectra, valid.
+    data_dir, output_dir, _ = trained
+    folder = tmp_path / "test_only"
+    folder.mkdir()
+    for name in ("src-test.txt", "tgt-test.txt"):
+        (folder / name).write_text((data_dir / name).read_text())
+    work = tmp_path / "work"
+    run([
+        "evaluate_exact_match.py", "--model-path", str(output_dir / "final_model"),
+        "--data-dir", str(folder), "--split", "test", "--num-outputs", "2",
+        "--batch-size", "4", "--max-new-tokens", "16", "--output-dir", str(work),
+    ])
+    predictions = folder / "prd-test_tiny.txt"
+    run([
+        "scripts/combine_results.py", "tiny", "--output-dir", str(work),
+        "--data-dir", str(folder), "--predictions", str(predictions), "--no-summary",
+    ])
+    assert len(predictions.read_text().splitlines()) == 2 * 64
+    assert not (work / "prd-test.txt").exists()
+
+    pytest.importorskip("rdkit")
+    run(["scripts/valid_smiles.py", str(predictions), "--data-dir", str(folder), "--workers", "1"])
+    assert json.loads((folder / "prd-test_tiny_valid.json").read_text())["samples"] == 64
+
+
 def spaced_copy(data_dir: Path, destination: Path) -> Path:
     """The dataset with its SMILES as space-separated characters, as alberts_2d stores them."""
     destination.mkdir(parents=True)

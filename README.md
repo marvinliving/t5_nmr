@@ -188,6 +188,33 @@ It also reports the share of valid candidates, overall and at each rank, and how
 
     python scripts/valid_smiles.py outputs/<run>/prd-test.txt --data-dir /projects/b5an/alberts_2d
 
+### 6. Predict on any folder
+
+    ./submit.sh predict xxl_4x1x4_10ep_on_nmr_expt_data
+
+This runs a trained run's model on any folder of spectra and saves the predictions in that folder. Each prediction is a config file, `configs/predict/<name>.env`, that names the run's training config and the folder:
+
+    RUN=xxl_4x1x4_10ep
+    EVAL_DATA_DIR=/projects/b5an/nmr_expt_data
+
+The folder needs only `src-test.txt` and `tgt-test.txt`; train and val files aren't needed. To make a new prediction, copy the example config, or start from `configs/predict_template.env`, which lists every setting.
+
+The job does what steps 3 to 5 do: it evaluates the run's `final_model` as `./submit.sh evaluate <run>` would, combines the chunks, and then checks the predictions with RDKit. Settings come from the predict config first, then from the run's config, then from the environment, so `NUM_OUTPUTS`, `EVAL_GPUS` and the rest work as they do for `evaluate`. `PREDICT_VALID=0` skips the RDKit job. Two files are written next to the spectra, named after the model:
+
+- `prd-test_<model>.txt`: the N most likely SMILES for each spectrum, best first, in the same layout as `prd-test.txt`.
+- `prd-test_<model>_valid.json`: the valid-SMILES scores of step 5.
+
+`<model>` is the run name, for example `prd-test_xxl_4x1x4_10ep.txt`, so predictions from earlier models already in the folder are never overwritten. Two predict configs with the same model and folder do write the same file.
+
+`MODEL_PATH` uses another model of the run:
+
+- `MODEL_PATH=outputs/<run>/checkpoint-<N>`, a checkpoint of a run without FSDP, writes `prd-test_<run>_checkpoint-<N>.txt`;
+- `MODEL_PATH=outputs/<run>_gb<N>/final_model`, a run trained with `--nodes` or `--gpus`, writes `prd-test_<run>_gb<N>.txt`.
+
+FSDP checkpoints are stored as shards and can't be loaded this way; `./submit.sh progress` scores them.
+
+Submission checks that the model and the files exist and that the folder is writable, so a typo fails at once rather than after waiting in the queue. The chunks' working files go to `outputs/predict/<name>/`. The logs are `logs/eval_predict_<name>_*`, `logs/combine_predict_<name>_*.out` and `logs/valid_predict_<name>_*.out`. The summary row in `reports/evaluation_summary.tsv` is `<model>_on_<folder name>`. If a chunk runs out of time, submit the prediction again. Chunks continue where they stopped, finished ones only re-score without loading the model, and the combine and RDKit jobs run again.
+
 ## Runs
 
 Each file in `configs/train/` is one run. It holds only the settings that differ from the defaults, for example `configs/train/xxl_2x2x4_10ep.env`:
@@ -298,7 +325,9 @@ NMR inputs are never truncated. T5 has no fixed maximum input length, so the who
 | `PROGRESS_GPUS` | 4 | GPUs of the progress job's one node, each scoring its own share of the checkpoints. 1 runs on one GPU |
 | `PROGRESS_MEM` | whole node; `64G` with `PROGRESS_GPUS=1` | Host memory of the progress job |
 | `PROGRESS_TIME` | `04:00:00` | Time limit of the progress job. Submitted again, it carries on where it stopped |
-| `VALID_TIME` | `02:00:00` | Time limit of `./submit.sh valid` |
+| `VALID_TIME` | `02:00:00` | Time limit of `./submit.sh valid` and of the RDKit job of `./submit.sh predict` |
+| `MODEL_PATH` | `outputs/<run>/final_model` | Model that `./submit.sh predict` uses; set only in a predict config (see [Predict on any folder](#6-predict-on-any-folder)) |
+| `PREDICT_VALID` | 1 | 0 skips the RDKit job of `./submit.sh predict` |
 
 Other `sbatch` options can be added after the run name, for example `./submit.sh train xl_4x1x4_10ep --qos=long`. They apply only to the first job, not to the jobs it resubmits.
 
@@ -437,8 +466,8 @@ Rows added by `scripts/combine_results.py` are named after the run. Older rows a
 
     pytest tests/
 
-- `tests/test_units.py` checks the evaluation bookkeeping (resume, chunk tiling, summary rows), the loss history, which checkpoints `SAVE_STRATEGY=epoch` keeps, and the training setup in about a minute. One test trains a tiny model under FSDP on two CPU processes, saves a sharded checkpoint, and checks that `checkpoint_progress.py` loads exactly those weights.
-- `tests/test_smoke.py` trains `google/flan-t5-small` for 3 steps on CPU on a tiny synthetic dataset. It then evaluates, resumes an interrupted evaluation, combines the chunks, and scores the checkpoints with `checkpoint_progress.py`, on its own validation set and on all of a second, external dataset, including resuming an interrupted scoring, sharing the checkpoints between two tasks and top-2 beam search. It also writes the loss curve with `loss_curve.py`. It downloads the model on first use and takes a few minutes.
+- `tests/test_units.py` checks the evaluation bookkeeping (resume, chunk tiling, summary rows), the loss history, how run and predict configs are loaded, which checkpoints `SAVE_STRATEGY=epoch` keeps, and the training setup in about a minute. One test trains a tiny model under FSDP on two CPU processes, saves a sharded checkpoint, and checks that `checkpoint_progress.py` loads exactly those weights.
+- `tests/test_smoke.py` trains `google/flan-t5-small` for 3 steps on CPU on a tiny synthetic dataset. It then evaluates, resumes an interrupted evaluation, combines the chunks, and scores the checkpoints with `checkpoint_progress.py`, on its own validation set and on all of a second, external dataset, including resuming an interrupted scoring, sharing the checkpoints between two tasks and top-2 beam search. It also writes the loss curve with `loss_curve.py`, and runs the steps of `./submit.sh predict` on a folder that holds only the test split. It downloads the model on first use and takes a few minutes.
 
 GitHub Actions runs both on every push (`.github/workflows/smoke.yml`). `python tests/make_tiny_dataset.py` writes the tiny dataset to `tmp/tiny/` for trying things by hand.
 
@@ -448,10 +477,14 @@ GitHub Actions runs both on every push (`.github/workflows/smoke.yml`). `python 
     config.py                    training configuration from environment variables
     nmr_data.py                  data loading and tokenization
     evaluate_exact_match.py      evaluation program (also used for the quick test)
-    submit.sh                    submits training, evaluation, check, progress and valid jobs
+    submit.sh                    submits training, evaluation, check, progress, valid and predict jobs
     configs/train/*.env          one file per run
     configs/template.env         every setting at its default
+    configs/predict/*.env        one file per prediction: a run's model and a dataset folder
+    configs/predict_template.env every prediction setting at its default
     slurm/env.sh                 cluster-specific settings
+    slurm/load_run.sh            loads a run's config for submit.sh and the jobs
+    slurm/load_predict.sh        loads a prediction's config, on top of its run's
     slurm/*.sbatch               Slurm job templates
     scripts/combine_results.py   combines evaluation chunks
     scripts/checkpoint_progress.py  top-1 to top-N exact match of every checkpoint, on any

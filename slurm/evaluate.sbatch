@@ -3,7 +3,8 @@
 # the split is cut into (array tasks x EVAL_GPUS) equal chunks, and each array
 # task evaluates EVAL_GPUS of them at once, one per GPU. Submit with
 # ./submit.sh evaluate <run>; EVAL_DATA_DIR=<folder> evaluates on another
-# dataset, with results in outputs/<run>/eval_<folder name>/.
+# dataset, with results in outputs/<run>/eval_<folder name>/. ./submit.sh
+# predict <name> runs it for configs/predict/<name>.env.
 #SBATCH --output=logs/%x_%A_%a.out
 
 set -e
@@ -14,7 +15,9 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 cd "$SLURM_SUBMIT_DIR"
 source slurm/env.sh
-source slurm/load_run.sh
+# ./submit.sh predict sets PREDICT: a run's model on the dataset of
+# configs/predict/$PREDICT.env.
+if [ -n "${PREDICT:-}" ]; then source slurm/load_predict.sh; else source slurm/load_run.sh; fi
 setup_job_env
 
 # Candidate SMILES generated per spectrum, most likely first (1 = top-1 only).
@@ -35,8 +38,9 @@ CHUNK_SIZE=$(( (TOTAL + CHUNKS - 1) / CHUNKS ))
 CHUNK_SIZE=$(( (CHUNK_SIZE + 999) / 1000 * 1000 ))
 export TOTAL CHUNK_SIZE NUM_OUTPUTS EVAL_SPLIT
 
+[ -z "${PREDICT:-}" ] || echo "Prediction: $PREDICT"
 echo "Run: $RUN"
-echo "Model: $OUTPUT_DIR/final_model"
+echo "Model: $MODEL_PATH"
 echo "Data: $EVAL_DATA_DIR ($EVAL_SPLIT split)"
 echo "Results: $EVAL_RESULTS_DIR"
 echo "Array task: $SLURM_ARRAY_TASK_ID of $SLURM_ARRAY_TASK_COUNT, $EVAL_GPUS GPU(s)"
@@ -59,7 +63,7 @@ evaluate_chunk() {
   fi
   # --resume continues a chunk that was killed from where it stopped.
   python evaluate_exact_match.py \
-    --model-path "$OUTPUT_DIR/final_model" \
+    --model-path "$MODEL_PATH" \
     --data-dir "$EVAL_DATA_DIR" \
     --output-dir "$EVAL_RESULTS_DIR" \
     --split "$EVAL_SPLIT" \
