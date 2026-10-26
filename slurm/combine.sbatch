@@ -36,7 +36,8 @@ if [ -n "${PREDICT:-}" ]; then
 fi
 # EVAL_MAX_ROWS evaluated only the first rows, as in evaluate.sbatch.
 if [ "${EVAL_SPLIT:-test}" = validation ]; then split_file=val; else split_file=test; fi
-TOTAL=$(wc -l < "$EVAL_DATA_DIR/tgt-$split_file.txt")
+# Rows as Python reads them: wc -l would miss a last line without a newline.
+TOTAL=$(awk 'END { print NR }' "$EVAL_DATA_DIR/tgt-$split_file.txt")
 if [ "${EVAL_MAX_ROWS:-0}" -gt 0 ] && [ "$EVAL_MAX_ROWS" -lt "$TOTAL" ]; then
   options+=(--total "$EVAL_MAX_ROWS")
 fi

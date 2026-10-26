@@ -25,7 +25,8 @@ NUM_OUTPUTS="${NUM_OUTPUTS:-10}"
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
 
 if [ "$EVAL_SPLIT" = validation ]; then split_file=val; else split_file=test; fi
-TOTAL=$(wc -l < "$EVAL_DATA_DIR/tgt-$split_file.txt")
+# Rows as Python reads them: wc -l would miss a last line without a newline.
+TOTAL=$(awk 'END { print NR }' "$EVAL_DATA_DIR/tgt-$split_file.txt")
 # EVAL_MAX_ROWS evaluates only the first rows, e.g. 20000 to compare recipes.
 if [ "${EVAL_MAX_ROWS:-0}" -gt 0 ] && [ "$EVAL_MAX_ROWS" -lt "$TOTAL" ]; then
   TOTAL="$EVAL_MAX_ROWS"
