@@ -44,6 +44,9 @@ def env_bool(name: str, default: bool) -> bool:
 class TrainConfig:
     # ===== Experiment identity =====
     model_name: str
+    # Trained model to fine-tune instead of the pretrained model_name; None
+    # for a run from the pretrained model.
+    finetune_model_path: Path | None
     data_dir: Path
     output_dir: Path
     tokenized_cache_dir: Path
@@ -136,8 +139,16 @@ class TrainConfig:
                 f"LR_SCALING must be one of {LR_SCALINGS}, got {lr_scaling!r}"
             )
 
+        # Set by slurm/load_run.sh from FINETUNE_FROM, or by a config.
+        finetune_model_path = env_str("FINETUNE_MODEL_PATH", "").strip()
+        finetuning = bool(finetune_model_path)
+
         # steps: every SAVE_STEPS updates. epoch: at the end of every epoch.
-        save_strategy = env_str("SAVE_STRATEGY", "steps").strip().lower()
+        # A fine-tune keeps every epoch, so ./submit.sh progress can show
+        # where it starts to lose what the base model knew.
+        save_strategy = env_str(
+            "SAVE_STRATEGY", "epoch" if finetuning else "steps"
+        ).strip().lower()
         if save_strategy not in SAVE_STRATEGIES:
             raise ValueError(
                 f"SAVE_STRATEGY must be one of {SAVE_STRATEGIES}, got {save_strategy!r}"
@@ -145,6 +156,7 @@ class TrainConfig:
 
         return cls(
             model_name=model_name,
+            finetune_model_path=Path(finetune_model_path) if finetuning else None,
             data_dir=Path(env_str("DATA_DIR", str(BASE_DIR / "alberts_2d"))),
             output_dir=output_dir,
             tokenized_cache_dir=Path(
@@ -153,7 +165,9 @@ class TrainConfig:
             prefix=env_str("PREFIX", DEFAULT_PREFIX),
             target_max_length=env_int("TARGET_MAX_LENGTH", 640),
             seed=env_int("SEED", 42),
-            learning_rate=env_float("LEARNING_RATE", 5e-5),
+            # A fine-tune starts from a trained model, so it takes smaller
+            # steps than training from the pretrained one.
+            learning_rate=env_float("LEARNING_RATE", 1e-5 if finetuning else 5e-5),
             lr_scaling=lr_scaling,
             # The global batch the earlier results were trained with.
             base_batch=env_int("BASE_BATCH", 16),

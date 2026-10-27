@@ -311,3 +311,43 @@ def test_no_space_model_scored_on_spaced_references(trained, tmp_path):
     assert "spaces ignored =====" in stdout
     progress_dir = output_dir / "progress" / "spaced_test"
     assert json.loads((progress_dir / "checkpoint-3.json").read_text())["ignore_spaces"] is True
+
+
+def test_finetune_keeps_every_epoch_and_scores_the_start_model(trained, tmp_path):
+    data_dir, output_dir, env = trained
+    base_model = output_dir / "final_model"
+    base_saved = (base_model / "model.safetensors").stat().st_mtime_ns
+    finetune_dir = tmp_path / "finetune"
+    finetune_env = {
+        **env,
+        "FINETUNE_MODEL_PATH": str(base_model),
+        # 8 molecules in batches of 4: 2 steps per epoch.
+        "DATA_DIR": str(make_tiny_dataset(tmp_path / "other", rows=8)),
+        "OUTPUT_DIR": str(finetune_dir),
+        "MAX_STEPS": "0",
+        "NUM_EPOCHS": "2",
+    }
+    stdout = run(["t5_train.py"], finetune_env)
+    assert f"Fine-tuning {base_model}" in stdout
+
+    config = json.loads((finetune_dir / "run_config.json").read_text())
+    assert config["finetune_model_path"] == str(base_model)
+    # The fine-tuning defaults: smaller steps, and every epoch kept.
+    assert config["learning_rate"] == 1e-5
+    assert config["save_strategy"] == "epoch"
+    assert (finetune_dir / "checkpoint-2").is_dir()
+    assert (finetune_dir / "checkpoint-4").is_dir()
+    assert (finetune_dir / "final_model" / "config.json").is_file()
+    # The base run is left as it was.
+    assert (base_model / "model.safetensors").stat().st_mtime_ns == base_saved
+
+    # On the base run's data, the model it started from is epoch 0.
+    run([
+        "scripts/checkpoint_progress.py", str(finetune_dir), "--base-model", MODEL_NAME,
+        "--batch-size", "4", "--max-new-tokens", "16",
+        "--data-dir", str(data_dir), "--samples", "8",
+    ])
+    rows = read_tsv(finetune_dir / "progress" / "data_validation" / "progress.tsv")
+    assert [(row["model"], row["epoch"]) for row in rows] == [
+        ("start_model", "0"), ("checkpoint-2", "1.0"), ("checkpoint-4", "2.0"),
+    ]

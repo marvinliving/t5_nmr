@@ -179,7 +179,13 @@ def save_metrics_file(output_dir: Path, split: str, metrics: dict) -> None:
 
 # Settings a checkpoint depends on: resuming with different values would
 # either fail to load sharded state or silently change the recipe mid-run.
-RESUME_KEYS = ("world_size", "parallel_mode", "global_batch_size", "effective_learning_rate")
+RESUME_KEYS = (
+    "world_size",
+    "parallel_mode",
+    "global_batch_size",
+    "effective_learning_rate",
+    "finetune_model_path",
+)
 
 
 def check_resume_compatible(config: TrainConfig, checkpoint: str | None) -> None:
@@ -211,6 +217,26 @@ def final_model_is_complete(final_model_dir: Path) -> bool:
         (final_model_dir / name).is_file()
         for name in ("model.safetensors", "model.safetensors.index.json")
     )
+
+
+def check_finetune_model(config: TrainConfig) -> None:
+    """Refuse to fine-tune a model that can't be loaded, or into its own run's folder."""
+    model_path = config.finetune_model_path
+    if model_path is None:
+        return
+    problem = None
+    if not final_model_is_complete(model_path):
+        # Also an FSDP checkpoint: it holds shards, not a loadable model.
+        problem = f"{model_path} holds no complete model (config.json and model.safetensors)"
+    elif config.output_dir.resolve() in (model_path.resolve(), *model_path.resolve().parents):
+        problem = (
+            f"the output folder {config.output_dir} would hold the model it starts "
+            f"from, {model_path}; fine-tune into a run of its own"
+        )
+    if problem:
+        if config.is_main_process:
+            print(f"Cannot fine-tune: {problem}", file=sys.stderr)
+        sys.exit(1)
 
 
 def print_config(config: TrainConfig, use_bf16: bool) -> None:
@@ -318,6 +344,7 @@ def main() -> None:
         if config.is_main_process:
             print("Training already finished:", final_model_dir)
         return
+    check_finetune_model(config)
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = get_last_checkpoint(str(config.output_dir))
@@ -371,8 +398,10 @@ def main() -> None:
         # Lets from_pretrained see FSDP before the Trainer creates it, so
         # cpu_ram_efficient_loading applies to this load.
         os.environ["ACCELERATE_USE_FSDP"] = "true"
+    # A fine-tune starts from its base run's model; the tokenizer above is
+    # the one that model was trained with.
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        config.model_name,
+        config.finetune_model_path or config.model_name,
         local_files_only=config.local_files_only,
     )
     fix_t5_embeddings(model)
@@ -403,6 +432,8 @@ def main() -> None:
     if config.is_main_process:
         if checkpoint:
             print("Resuming from checkpoint:", checkpoint)
+        elif config.finetune_model_path:
+            print("Fine-tuning", config.finetune_model_path)
         else:
             print("Starting training from the pretrained model")
 

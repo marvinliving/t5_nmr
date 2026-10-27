@@ -12,6 +12,10 @@ training loss keeps falling, it is overtraining. The dataset can be the run's
 own or another one; ./submit.sh progress (slurm/progress.sbatch) scores the
 test split of the external dataset, nmr_expt_data, by default.
 
+For a fine-tuning run it also scores the model the run started from, as
+start_model at epoch 0. On the base run's dataset, the table then shows how
+much of what the base model knew each epoch of fine-tuning has lost.
+
 --num-outputs 1 is greedy top-1. A larger value uses beam search and scores
 top-1 to top-N, for example --num-outputs 10. If the run was trained on
 no-space SMILES and the dataset stores them as spaced tokens, or the reverse,
@@ -63,6 +67,10 @@ from t5_train import final_model_is_complete, fix_t5_embeddings  # noqa: E402
 
 # Where accelerate saves an FSDP SHARDED_STATE_DICT checkpoint's model.
 FSDP_MODEL_DIR = "pytorch_model_fsdp_0"
+
+# Name of the model a fine-tuning run started from in the results and table;
+# not final_model, which is the run's own.
+START_MODEL = "start_model"
 
 
 def parse_args() -> argparse.Namespace:
@@ -160,6 +168,22 @@ def find_models(output_dir: Path) -> list[Path]:
     return checkpoints
 
 
+def start_model(output_dir: Path) -> Path | None:
+    """The model a fine-tuning run started from, from its run_config.json.
+
+    None for a run from the pretrained model, or if the model is gone.
+    """
+    config_path = output_dir / "run_config.json"
+    if not config_path.is_file():
+        return None
+    model_path = json.loads(config_path.read_text()).get("finetune_model_path")
+    if not model_path:
+        return None
+    # A relative path is relative to the repository root.
+    model_path = REPO_DIR / model_path
+    return model_path if final_model_is_complete(model_path) else None
+
+
 def eval_losses(output_dir: Path) -> dict[int, float]:
     """Validation loss by step, from every trainer_state.json of the run."""
     return {
@@ -251,17 +275,21 @@ def score_models(args: argparse.Namespace, progress_dir: Path, dataset, settings
     scoring finishes, so no two tasks pick the same model. A model with a
     .partial.json is still to do, and is resumed by whichever task gets it.
     """
+    models = [(model_dir.name, model_dir) for model_dir in find_models(args.output_dir)]
+    base_model_dir = start_model(args.output_dir)
+    if base_model_dir:
+        models.insert(0, (START_MODEL, base_model_dir))
     todo = []
-    for model_dir in find_models(args.output_dir):
-        result_path = progress_dir / f"{model_dir.name}.json"
+    for name, model_dir in models:
+        result_path = progress_dir / f"{name}.json"
         if result_path.is_file() and same_settings(json.loads(result_path.read_text()), settings):
-            print(f"{model_dir.name}: already scored")
+            print(f"{name}: already scored")
         else:
-            todo.append(model_dir)
+            todo.append((name, model_dir))
     mine = todo[args.task::args.tasks]
     print(
         f"Task {args.task} of {args.tasks}: scoring "
-        f"{', '.join(model_dir.name for model_dir in mine) or 'nothing'}"
+        f"{', '.join(name for name, _ in mine) or 'nothing'}"
     )
     if not mine:
         return
@@ -273,22 +301,26 @@ def score_models(args: argparse.Namespace, progress_dir: Path, dataset, settings
         args.base_model, use_fast=True, local_files_only=args.local_files_only
     )
     losses = eval_losses(args.output_dir)
-    for model_dir in mine:
-        print(f"===== {model_dir.name} =====")
+    for name, model_dir in mine:
+        print(f"===== {name} =====")
         start = time.time()
         try:
-            progress = training_progress(model_dir, args.output_dir, losses)
+            if name == START_MODEL:
+                # Before the first step of fine-tuning.
+                progress = {"epoch": 0, "step": 0, "eval_loss": None}
+            else:
+                progress = training_progress(model_dir, args.output_dir, losses)
             model = load_model(
                 model_dir, args.base_model, dtype, device, args.local_files_only
             )
         except FileNotFoundError as error:
             # Training deletes old checkpoints, possibly while this runs.
-            print(f"Skipped {model_dir.name}: {error}")
+            print(f"Skipped {name}: {error}")
             continue
         # Predictions are written as they are made, so a job stopped at its
         # time limit carries on from them when submitted again.
-        predictions_path = progress_dir / f"{model_dir.name}_predictions.txt"
-        partial_path = progress_dir / f"{model_dir.name}.partial.json"
+        predictions_path = progress_dir / f"{name}_predictions.txt"
+        partial_path = progress_dir / f"{name}.partial.json"
         done, matches = 0, [0] * args.num_outputs
         if partial_path.is_file() and same_settings(json.loads(partial_path.read_text()), settings):
             done, matches = resume_predictions(
@@ -318,16 +350,16 @@ def score_models(args: argparse.Namespace, progress_dir: Path, dataset, settings
         torch.cuda.empty_cache()
 
         result = {
-            "model": model_dir.name,
+            "model": name,
             **progress,
             "exact_match": matches[0] / len(dataset),
             **top_n_exact_match(matches, len(dataset)),
             **settings,
             "seconds": round(time.time() - start, 1),
         }
-        (progress_dir / f"{model_dir.name}.json").write_text(json.dumps(result, indent=2) + "\n")
+        (progress_dir / f"{name}.json").write_text(json.dumps(result, indent=2) + "\n")
         partial_path.unlink()
-        print(f"{model_dir.name}: exact match {result['exact_match']:.4f}")
+        print(f"{name}: exact match {result['exact_match']:.4f}")
 
 
 def print_table(rows: list[dict], columns: list[str]) -> None:

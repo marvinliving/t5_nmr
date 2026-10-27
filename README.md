@@ -243,6 +243,35 @@ To add a run, copy a config under a new name, or start from `configs/template.en
 
 `probe_xl_4x4_nogc` is not a real run. It trains XL for 200 steps without gradient checkpointing and prints the peak GPU memory, to find out whether single-GPU XL runs need gradient checkpointing at all.
 
+### Fine-tuning runs
+
+A fine-tuning run takes the finished model of another run and trains it further, usually on another dataset. Its config names the run to start from with `FINETUNE_FROM`, for example `configs/train/xxl_4x1x4_10ep_ft_<dataset>.env`:
+
+    FINETUNE_FROM=xxl_4x1x4_10ep
+    DATA_DIR=/projects/b5an/<dataset>
+    # Optional: the fine-tuning defaults are LEARNING_RATE=1e-5 and NUM_EPOCHS=3.
+    #LEARNING_RATE=2e-5
+
+Submit it like any run, `./submit.sh train xxl_4x1x4_10ep_ft_<dataset>`. It starts from `outputs/xxl_4x1x4_10ep/final_model` and writes to its own folder, `outputs/xxl_4x1x4_10ep_ft_<dataset>`; the base run's folder is never touched. Name fine-tuning runs `<base run>_ft_<dataset>`. The dataset needs the same six files as `alberts_2d`.
+
+The base run's config is loaded first and the fine-tuning run's config on top, so the fine-tuning config holds only what differs. The model, batch, GPUs, parallel mode and memory settings are the base run's, except for four settings, which a fine-tuning run never inherits:
+
+| Setting | Fine-tuning default | Why |
+|---|---|---|
+| `LEARNING_RATE` | 1e-5 (5e-5 for other runs) | The model is already trained, so it takes smaller steps. `LR_SCALING` and `WARMUP_RATIO` still follow the base run |
+| `NUM_EPOCHS` | 3 | Not the base run's 10 |
+| `SAVE_STRATEGY` | `epoch` | Every epoch's checkpoint is kept, to find where fine-tuning goes too far (below) |
+| `OUTPUT_DIR` | `outputs/<run>` | Its own folder |
+
+To change one, set it in the fine-tuning config: these four, like `FINETUNE_FROM`, are not read from variables given at submission. For a learning-rate sweep, make one config per rate. The optimizer and learning-rate schedule start fresh. `submit.sh` refuses a fine-tuning run whose base hasn't finished, and the base can't itself be a fine-tuning run. To start from something other than the base run's `final_model`, such as a `_gb<N>` folder or a DDP `checkpoint-<N>`, set `FINETUNE_MODEL_PATH` in the config. FSDP checkpoints hold shards and can't be used.
+
+**Has fine-tuning gone too far?** Fine-tuning for too long can make the model forget what it learned in the base run. `./submit.sh progress` scores every epoch checkpoint. For a fine-tuning run, its first row, `start_model` at epoch 0, is the base model before any fine-tuning. Score it on both datasets:
+
+    EVAL_DATA_DIR=/projects/b5an/<dataset>    ./submit.sh progress xxl_4x1x4_10ep_ft_<dataset>
+    EVAL_DATA_DIR=/projects/b5an/alberts_2d   ./submit.sh progress xxl_4x1x4_10ep_ft_<dataset>
+
+On the new dataset, exact match should rise from `start_model`. On `alberts_2d`, the `change` column shows how much each epoch lost of what the base model knew. The best epoch is one where the new dataset has levelled off before `alberts_2d` falls far. As in `xxl_4x1x4_10ep`, an XXL fine-tune keeps its newest two epoch checkpoints whole (about 135 GB each) and older ones without optimizer state (about 44 GB each).
+
 ### Runs from before `configs/`
 
 Runs trained with the old per-run scripts keep their output folders; their configs set `OUTPUT_DIR` to the old folder, so they can still be evaluated and resumed:
@@ -263,20 +292,22 @@ The single-GPU XXL scripts (`xxl_4x4_10ep`, `xxl_2x8_10ep`, `xxl_1x16_10ep`) wer
 
 ### Variables
 
-A config sets any of these. Variables that a config doesn't set can also be given at submission, as in `MAX_STEPS=50 ./submit.sh train <run>`; when both set a variable, the config wins. The exceptions are `OUTPUT_DIR`, which comes only from the config or the run name, and `NODES`/`GPUS_PER_NODE`, which `--nodes` and `--gpus` override.
+A config sets any of these. Variables that a config doesn't set can also be given at submission, as in `MAX_STEPS=50 ./submit.sh train <run>`; when both set a variable, the config wins. The exceptions are `OUTPUT_DIR`, `FINETUNE_FROM` and `FINETUNE_MODEL_PATH`, which come only from the config or the run name, and `NODES`/`GPUS_PER_NODE`, which `--nodes` and `--gpus` override.
 
 **Training** (read by `t5_train.py` through `config.py`):
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `MODEL_NAME` | `google/flan-t5-base` | Hugging Face model to fine-tune |
+| `FINETUNE_FROM` | none | Run whose final model to fine-tune, with its config loaded under this one (see [Fine-tuning runs](#fine-tuning-runs)) |
+| `FINETUNE_MODEL_PATH` | `<FINETUNE_FROM's output folder>/final_model` | Model a fine-tuning run starts from |
 | `DATA_DIR` | `/projects/b5an/alberts_2d` (from `slurm/env.sh`) | Folder with the `src-*`/`tgt-*` files. A relative path is relative to the repository |
 | `OUTPUT_DIR` | `outputs/<run>` | Where checkpoints and the final model go |
 | `PER_GPU_BATCH` | 16 | Examples per GPU per step. Older configs call it `TRAIN_BATCH_SIZE`, which still works |
 | `GRAD_ACCUMULATION_STEPS` | 1 | Steps combined into each model update |
-| `NUM_EPOCHS` | 3 | Passes over the training data |
+| `NUM_EPOCHS` | 3 | Passes over the training data. Not inherited by a fine-tuning run |
 | `MAX_STEPS` | 0 | Stop after this many model updates, for smoke tests. 0 trains for `NUM_EPOCHS` |
-| `LEARNING_RATE` | 5e-5 | Learning rate for a global batch of `BASE_BATCH` |
+| `LEARNING_RATE` | 5e-5; 1e-5 for a fine-tuning run | Learning rate for a global batch of `BASE_BATCH` |
 | `BASE_BATCH` | 16 | The global batch `LEARNING_RATE` belongs to |
 | `LR_SCALING` | `none` | How the learning rate follows a larger global batch: `none`, `sqrt` or `linear` (see [Multi-node training](#multi-node-training)) |
 | `WARMUP_RATIO` | 0 | Share of training spent raising the learning rate from 0, for example 0.03 |
@@ -289,7 +320,7 @@ A config sets any of these. Variables that a config doesn't set can also be give
 | `GROUP_BY_LENGTH` | 0 | 1 batches spectra of similar length together (see [Performance](#performance-and-comparability)) |
 | `DATALOADER_NUM_WORKERS` | 4 on 1 GPU, 8 on several | Worker processes per GPU that prepare batches; also used to tokenize the data |
 | `SAVE_STEPS` / `SAVE_TOTAL_LIMIT` | 2000 / 2 | Checkpoint frequency and how many to keep. `SAVE_TOTAL_LIMIT` applies to `SAVE_STRATEGY=steps`; `epoch` keeps every epoch |
-| `SAVE_STRATEGY` | steps | `epoch` saves at the end of every epoch instead of every `SAVE_STEPS` updates |
+| `SAVE_STRATEGY` | steps; epoch for a fine-tuning run | `epoch` saves at the end of every epoch instead of every `SAVE_STEPS` updates |
 | `STOP_MARGIN_MINUTES` | 20 | Save and stop this long before the job's time limit |
 | `TEST_SAMPLE_SIZE` | 1000 | Test molecules in the quick end-of-training check |
 | `GENERATION_BATCH_SIZE` | 32 | Batch size for the quick check |
@@ -466,8 +497,8 @@ Rows added by `scripts/combine_results.py` are named after the run. Older rows a
 
     pytest tests/
 
-- `tests/test_units.py` checks the evaluation bookkeeping (resume, chunk tiling, summary rows), the loss history, how run and predict configs are loaded, which checkpoints `SAVE_STRATEGY=epoch` keeps, and the training setup in about a minute. One test trains a tiny model under FSDP on two CPU processes, saves a sharded checkpoint, and checks that `checkpoint_progress.py` loads exactly those weights.
-- `tests/test_smoke.py` trains `google/flan-t5-small` for 3 steps on CPU on a tiny synthetic dataset. It then evaluates, resumes an interrupted evaluation, combines the chunks, and scores the checkpoints with `checkpoint_progress.py`, on its own validation set and on all of a second, external dataset, including resuming an interrupted scoring, sharing the checkpoints between two tasks and top-2 beam search. It also writes the loss curve with `loss_curve.py`, and runs the steps of `./submit.sh predict` on a folder that holds only the test split. It downloads the model on first use and takes a few minutes.
+- `tests/test_units.py` checks the evaluation bookkeeping (resume, chunk tiling, summary rows), the loss history, how run, fine-tuning and predict configs are loaded, which checkpoints `SAVE_STRATEGY=epoch` keeps, and the training setup in about a minute. One test trains a tiny model under FSDP on two CPU processes, saves a sharded checkpoint, and checks that `checkpoint_progress.py` loads exactly those weights.
+- `tests/test_smoke.py` trains `google/flan-t5-small` for 3 steps on CPU on a tiny synthetic dataset. It then evaluates, resumes an interrupted evaluation, combines the chunks, and scores the checkpoints with `checkpoint_progress.py`, on its own validation set and on all of a second, external dataset, including resuming an interrupted scoring, sharing the checkpoints between two tasks and top-2 beam search. It also writes the loss curve with `loss_curve.py`, runs the steps of `./submit.sh predict` on a folder that holds only the test split, and fine-tunes the trained model on a second dataset for two epochs, keeping both epoch checkpoints, and scores them after the model it started from. It downloads the model on first use and takes a few minutes.
 
 GitHub Actions runs both on every push (`.github/workflows/smoke.yml`). `python tests/make_tiny_dataset.py` writes the tiny dataset to `tmp/tiny/` for trying things by hand.
 
@@ -483,7 +514,8 @@ GitHub Actions runs both on every push (`.github/workflows/smoke.yml`). `python 
     configs/predict/*.env        one file per prediction: a run's model and a dataset folder
     configs/predict_template.env every prediction setting at its default
     slurm/env.sh                 cluster-specific settings
-    slurm/load_run.sh            loads a run's config for submit.sh and the jobs
+    slurm/load_run.sh            loads a run's config for submit.sh and the jobs, on top
+                                 of its base run's for a fine-tuning run
     slurm/load_predict.sh        loads a prediction's config, on top of its run's
     slurm/*.sbatch               Slurm job templates
     scripts/combine_results.py   combines evaluation chunks

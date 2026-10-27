@@ -623,3 +623,141 @@ def test_prediction_loads_its_run_and_writes_next_to_the_data():
         "EVAL_RESULTS_DIR": "outputs/predict/xxl_4x1x4_10ep_on_nmr_expt_data",
         "PREDICTIONS_FILE": "/projects/b5an/nmr_expt_data/prd-test_xxl_4x1x4_10ep.txt",
     }
+
+
+@pytest.fixture
+def finetune_configs():
+    """Write run configs into configs/train for one test, removed afterwards."""
+    written = []
+
+    def write(run: str, text: str) -> str:
+        path = REPO_DIR / "configs" / "train" / f"{run}.env"
+        written.append(path)
+        path.write_text(text)
+        return run
+
+    yield write
+    for path in written:
+        path.unlink(missing_ok=True)
+
+
+def test_finetune_run_loads_on_top_of_its_base_run(finetune_configs):
+    run = finetune_configs(
+        "_test_finetune", "FINETUNE_FROM=xxl_4x1x4_10ep\nDATA_DIR=/projects/b5an/other\n"
+    )
+    names = (
+        "MODEL_NAME", "PARALLEL_MODE", "EVAL_BATCH_SIZE", "DATA_DIR", "OUTPUT_DIR",
+        "FINETUNE_MODEL_PATH", "LEARNING_RATE", "NUM_EPOCHS", "SAVE_STRATEGY",
+    )
+    # Values left in the environment, as by an earlier run, are not used either.
+    values = loaded(
+        "slurm/load_run.sh", {"RUN": run, "LEARNING_RATE": "1", "NUM_EPOCHS": "1"}, names
+    )
+    assert values == {
+        # The base run's settings...
+        "MODEL_NAME": "google/flan-t5-xxl",
+        "PARALLEL_MODE": "fsdp",
+        "EVAL_BATCH_SIZE": "4",
+        # ...with the fine-tuning run's own on top.
+        "DATA_DIR": "/projects/b5an/other",
+        "OUTPUT_DIR": f"outputs/{run}",
+        "FINETUNE_MODEL_PATH": "outputs/xxl_4x1x4_10ep/final_model",
+        # Not inherited, so config.py's fine-tuning defaults apply.
+        "LEARNING_RATE": "",
+        "NUM_EPOCHS": "",
+        "SAVE_STRATEGY": "",
+    }
+
+
+def test_finetune_run_sets_its_own_learning_rate(finetune_configs):
+    run = finetune_configs(
+        "_test_finetune", "FINETUNE_FROM=small_4x4_3ep\nLEARNING_RATE=2e-5\nNUM_EPOCHS=5\n"
+    )
+    names = ("OUTPUT_DIR", "FINETUNE_MODEL_PATH", "LEARNING_RATE", "NUM_EPOCHS")
+    assert loaded("slurm/load_run.sh", {"RUN": run}, names) == {
+        # The base run's OUTPUT_DIR names the folder of its model, not this run's.
+        "OUTPUT_DIR": f"outputs/{run}",
+        "FINETUNE_MODEL_PATH": "outputs/flan-t5-small_nmr_input1536_4x4_3ep/final_model",
+        "LEARNING_RATE": "2e-5",
+        "NUM_EPOCHS": "5",
+    }
+
+
+def test_run_from_the_pretrained_model_ignores_finetuning_in_the_environment():
+    values = loaded(
+        "slurm/load_run.sh",
+        {
+            "RUN": "xl_4x1x4_10ep",
+            "FINETUNE_FROM": "xxl_4x1x4_10ep",
+            "FINETUNE_MODEL_PATH": "/elsewhere/model",
+        },
+        ("MODEL_NAME", "FINETUNE_MODEL_PATH"),
+    )
+    assert values == {"MODEL_NAME": "google/flan-t5-xl", "FINETUNE_MODEL_PATH": ""}
+
+
+def test_finetune_of_a_finetune_refused(finetune_configs):
+    import subprocess
+
+    finetune_configs("_test_finetune", "FINETUNE_FROM=xxl_4x1x4_10ep\n")
+    run = finetune_configs("_test_finetune_again", "FINETUNE_FROM=_test_finetune\n")
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        loaded("slurm/load_run.sh", {"RUN": run}, ("OUTPUT_DIR",))
+    assert "itself a fine-tuning run" in error.value.stderr
+
+
+def test_finetune_defaults(monkeypatch, tmp_path):
+    config = make_config(monkeypatch)
+    assert config.finetune_model_path is None
+    assert (config.learning_rate, config.save_strategy) == (5e-5, "steps")
+
+    model = tmp_path / "base" / "final_model"
+    config = make_config(monkeypatch, FINETUNE_MODEL_PATH=model)
+    assert config.finetune_model_path == model
+    assert config.to_dict()["finetune_model_path"] == str(model)
+    # Smaller steps, and a checkpoint at every epoch to find overtraining.
+    assert (config.learning_rate, config.save_strategy) == (1e-5, "epoch")
+
+    config = make_config(
+        monkeypatch, FINETUNE_MODEL_PATH=model, LEARNING_RATE=3e-5, SAVE_STRATEGY="steps"
+    )
+    assert (config.learning_rate, config.save_strategy) == (3e-5, "steps")
+
+
+def test_finetune_refuses_a_missing_model_and_the_base_runs_folder(monkeypatch, tmp_path):
+    from t5_train import check_finetune_model
+
+    model = tmp_path / "base" / "final_model"
+    config = make_config(monkeypatch, FINETUNE_MODEL_PATH=model, OUTPUT_DIR=tmp_path / "ft")
+    with pytest.raises(SystemExit):
+        check_finetune_model(config)
+
+    model.mkdir(parents=True)
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors").write_text("")
+    check_finetune_model(config)
+
+    into_base = make_config(
+        monkeypatch, FINETUNE_MODEL_PATH=model, OUTPUT_DIR=tmp_path / "base"
+    )
+    with pytest.raises(SystemExit):
+        check_finetune_model(into_base)
+
+
+def test_progress_finds_the_model_a_finetune_started_from(tmp_path):
+    from checkpoint_progress import start_model
+
+    run = tmp_path / "ft"
+    run.mkdir()
+    assert start_model(run) is None
+    (run / "run_config.json").write_text(json.dumps({"finetune_model_path": None}))
+    assert start_model(run) is None
+
+    model = tmp_path / "base" / "final_model"
+    (run / "run_config.json").write_text(json.dumps({"finetune_model_path": str(model)}))
+    # Deleted since, or never finished.
+    assert start_model(run) is None
+    model.mkdir(parents=True)
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors").write_text("")
+    assert start_model(run) == model

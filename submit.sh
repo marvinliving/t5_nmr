@@ -2,7 +2,9 @@
 # Submits a Slurm job for a run described by configs/train/<run>.env.
 #
 #   ./submit.sh train <run> [--nodes N] [--gpus N] [sbatch options]
-#                                                 train (resubmits itself until done)
+#                                                 train (resubmits itself until done);
+#                                                 a config with FINETUNE_FROM=<run>
+#                                                 fine-tunes that run's model
 #   ./submit.sh evaluate <run> [--nodes N] [--gpus N] [sbatch options]
 #                                                 full test-set evaluation (array job),
 #                                                 then combine_results.py once it succeeds
@@ -38,7 +40,7 @@ source slurm/env.sh
 mkdir -p logs
 
 usage() {
-  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 1
 }
 
@@ -170,6 +172,15 @@ esac
 
 case "$job" in
   train)
+    # Checked here so a base run that hasn't finished fails at submission,
+    # not on a GPU node after waiting in the queue.
+    if [ -n "$FINETUNE_MODEL_PATH" ]; then
+      if [ ! -f "$FINETUNE_MODEL_PATH/config.json" ]; then
+        echo "No model in $FINETUNE_MODEL_PATH (no config.json) to fine-tune: train ${BASE_RUN:-it} first, or set FINETUNE_MODEL_PATH in $RUN_CONFIG." >&2
+        exit 1
+      fi
+      echo "Fine-tuning: $FINETUNE_MODEL_PATH"
+    fi
     gpus="$GPUS_PER_NODE"
     if [ $((NODES * gpus)) -gt 1 ]; then
       # Whole-node memory: rank 0 holds the fp32 weights while loading and

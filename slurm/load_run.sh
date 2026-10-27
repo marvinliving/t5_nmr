@@ -13,14 +13,56 @@ if [ ! -f "$RUN_CONFIG" ]; then
   exit 1
 fi
 
-# The output folder comes from the config or is derived below, never from the
-# environment, so a job and the jobs it resubmits always agree on it.
-unset OUTPUT_DIR
+# The value a config file sets for a variable, or nothing.
+config_value() {
+  (unset "$2"; source "$1"; echo "${!2:-}")
+}
+
+# The output folder and the model to fine-tune come from the configs or are
+# derived below, never from the environment, so a job and the jobs it
+# resubmits always agree on them.
+unset OUTPUT_DIR FINETUNE_FROM FINETUNE_MODEL_PATH
+
+# A fine-tuning run (FINETUNE_FROM=<run> in its config) starts from that run's
+# final model, and its config holds only what differs from that run's: the
+# base run's config is loaded first, then the run's own on top.
+BASE_RUN=$(config_value "$RUN_CONFIG" FINETUNE_FROM)
+if [ -n "$BASE_RUN" ]; then
+  base_config="configs/train/$BASE_RUN.env"
+  if [ "$BASE_RUN" = "$RUN" ]; then
+    echo "$RUN_CONFIG: FINETUNE_FROM names the run itself" >&2
+    exit 1
+  fi
+  if [ ! -f "$base_config" ]; then
+    echo "$RUN_CONFIG: FINETUNE_FROM=$BASE_RUN, but there is no $base_config" >&2
+    exit 1
+  fi
+  if [ -n "$(config_value "$base_config" FINETUNE_FROM)" ]; then
+    echo "$RUN_CONFIG: $BASE_RUN is itself a fine-tuning run; start from its model with FINETUNE_MODEL_PATH and the settings it needs instead" >&2
+    exit 1
+  fi
+  base_dir=$(config_value "$base_config" OUTPUT_DIR)
+  base_dir="${base_dir:-outputs/$BASE_RUN}"
+  set -a
+  source "$base_config"
+  set +a
+  # Not inherited: the base run's folder, and the learning rate, length and
+  # checkpointing of its training, which take the fine-tuning defaults in
+  # config.py unless the run's own config sets them.
+  unset OUTPUT_DIR LEARNING_RATE NUM_EPOCHS SAVE_STRATEGY
+fi
 
 # Every variable in the config is exported to t5_train.py.
 set -a
 source "$RUN_CONFIG"
 set +a
+
+# The model a fine-tuning run starts from; empty for a run from the
+# pretrained MODEL_NAME.
+if [ -n "$BASE_RUN" ]; then
+  FINETUNE_MODEL_PATH="${FINETUNE_MODEL_PATH:-$base_dir/final_model}"
+fi
+export FINETUNE_MODEL_PATH="${FINETUNE_MODEL_PATH:-}"
 
 # --nodes and --gpus given to submit.sh (CLI_NODES, CLI_GPUS) override the
 # config, so one config can run on any number of nodes.
