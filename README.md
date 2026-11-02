@@ -178,13 +178,15 @@ Each chunk's results record the size of the test set. Results from evaluations m
     ./submit.sh valid xl_4x4_10ep
     EVAL_DATA_DIR=/projects/b5an/nmr_expt_data ./submit.sh valid xl_4x4_10ep
 
-Once the combine job has written `prd-test.txt`, this CPU job runs `scripts/valid_smiles.py` on it. It checks every candidate with RDKit and scores top-1 to top-N three ways:
+Once the combine job has written `prd-test.txt`, this CPU job runs `scripts/valid_smiles.py` on it. It checks every candidate with RDKit and scores top-1 to top-N five ways:
 
 - `raw_exact`: exact match as the evaluation scores it, including its rule for [SMILES spacing](#3-evaluate-the-model-on-the-full-test-set); here the model's spacing is read from the predictions themselves. It should equal the run's row in `reports/evaluation_summary.tsv`.
 - `valid_exact`: exact match after dropping candidates RDKit can't parse, so the *n*-th valid candidate moves up to rank *n*.
 - `valid_canonical`: as `valid_exact`, but comparing RDKit canonical SMILES, so the same molecule written differently counts, and a molecule repeated among the candidates is kept only once.
+- `formula_canonical`: as `valid_canonical`, but also dropping candidates whose molecular formula differs from the one the spectrum's input starts with (`C 11 H 14 O S 3 HNMR ...` is C11H14OS3). Hydrogens count; charges and isotopes don't.
+- `formula_vote`: the molecules of `formula_canonical`, ranked by how many candidates write them, most first. Molecules with the same count keep their beam order, so top-1 is the molecule predicted most often. Beam search never returns the same string twice, so a molecule gets more than one vote only when it's written in more than one way.
 
-It also reports the share of valid candidates, overall and at each rank, and how many reference SMILES RDKit can't parse; those can never score a canonical match. Accuracies are over all spectra. The table is in `logs/valid_<run>_<job>.out` and in `prd-test_valid.json` next to the predictions. A whole node bills the same as one core, so the job takes the node and runs one RDKit worker per core. It needs RDKit in the environment (`pip install rdkit`). To run it by hand, on any predictions file:
+It also reports the share of valid candidates, overall and at each rank, and how many reference SMILES RDKit can't parse; those can never score a canonical match. The same goes for the share of candidates with the input's formula, and for how many references have a different formula from their input; those can never score in the formula rankings, so a large count means the formulas aren't being read as the data writes them. An input that doesn't start with a formula keeps all its valid candidates in the formula rankings, and the number of such inputs is reported. Its spectra are left out of the formula shares. Accuracies are over all spectra. The table is in `logs/valid_<run>_<job>.out` and in `prd-test_valid.json` next to the predictions. A whole node bills the same as one core, so the job takes the node and runs one RDKit worker per core. It needs RDKit in the environment (`pip install rdkit`). To run it by hand, on any predictions file:
 
     python scripts/valid_smiles.py outputs/<run>/prd-test.txt --data-dir /projects/b5an/alberts_2d
 
