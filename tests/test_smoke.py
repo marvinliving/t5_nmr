@@ -59,7 +59,16 @@ def trained(tmp_path_factory):
     }
     for name in ("WORLD_SIZE", "RANK", "LOCAL_RANK", "SLURM_JOB_END_TIME"):
         os.environ.pop(name, None)
-    run(["t5_train.py"], env)
+    stdout = run(["t5_train.py"], env)
+    # The Slurm log train.sbatch would have written around it, for train_summary.py.
+    (root / "logs").mkdir()
+    (root / "logs" / "train_tiny_1.out").write_text(
+        "===== Slurm Job Info =====\nJob ID: 1\n"
+        "Start time: Tue Sep 29 18:00:00 BST 2026\n"
+        f"Output directory: {output_dir}\n===== Start Training =====\n"
+        + stdout
+        + "===== Training finished =====\nEnd time: Tue Sep 29 18:06:00 BST 2026\n"
+    )
     return data_dir, output_dir, env
 
 
@@ -228,6 +237,30 @@ def test_loss_curve_written(trained):
     rows = read_tsv(output_dir / "loss_curve.tsv")
     assert [row["step"] for row in rows] == ["1", "2", "3"]
     assert all(row["loss"] for row in rows)
+
+
+def test_train_summary_records_the_run_and_its_job(trained, tmp_path):
+    data_dir, output_dir, _ = trained
+    summary, jobs = tmp_path / "summary.tsv", tmp_path / "jobs.tsv"
+    run([
+        "scripts/train_summary.py", "tiny", "--output-dir", str(output_dir),
+        "--logs-dir", str(output_dir.parent / "logs"),
+        "--summary", str(summary), "--jobs", str(jobs),
+    ])
+    (row,) = read_tsv(summary)
+    assert row["experiment"] == "tiny"
+    assert (row["status"], row["last_outcome"]) == ("complete", "finished")
+    assert row["config_source"] == "run_config.json"
+    assert row["model_name"] == MODEL_NAME
+    # FLAN-T5-small with lm_head untied, as trained.
+    assert row["parameters"] == "76961152"
+    assert float(row["model_gb"]) > 0
+    assert (row["dataset"], row["train_rows"], row["test_rows"]) == (data_dir.name, "64", "64")
+    assert (row["steps_done"], row["total_steps"], row["global_batch"]) == ("3", "3", "4")
+    assert row["train_loss"]
+    assert row["quick_test_samples"] == "8"
+    (job,) = read_tsv(jobs)
+    assert (job["job_id"], job["outcome"], job["hours"], job["gpus"]) == ("1", "finished", "0.10", "1")
 
 
 def test_evaluation_results_go_to_output_dir(trained, tmp_path):

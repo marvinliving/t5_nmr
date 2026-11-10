@@ -47,6 +47,18 @@ python --version
 nvidia-smi
 
 
+# ===== Training summary =====
+
+# However the job ends, record the run in reports/training_summary.tsv and
+# its jobs, this one included, in reports/training_jobs.tsv. The exit status
+# stays the job's own, and a resubmission is already queued by then.
+record_training() {
+  python scripts/train_summary.py "$RUN" --output-dir "$OUTPUT_DIR" \
+    || echo "reports/training_summary.tsv not updated"
+}
+trap record_training EXIT
+
+
 # ===== Start training =====
 
 echo "===== Start Training ====="

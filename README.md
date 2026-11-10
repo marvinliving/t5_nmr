@@ -41,6 +41,8 @@ Line *N* of each `src-*.txt` file is an NMR spectrum, and line *N* of the matchi
 
     cd /projects/b5an && sha256sum alberts_2d/*.txt
 
+`data/manifest.tsv` records each file's path, size in bytes, line count and SHA-256, for `alberts_2d` and for the second dataset, `nmr_expt_data`, which also has `prd-test.txt`. The datasets' provenance, licensing and access instructions must be documented before any public release.
+
 Check the cluster settings in `slurm/env.sh`: the partition, the CUDA module, and `CONDA_ROOT` (default `~/miniforge3`). Then check that a GPU node works before using hours of GPU time:
 
     ./submit.sh test-gpu
@@ -116,6 +118,27 @@ Predictions are written as they are made, so if the job reaches its time limit (
 The Trainer logs the training loss every `LOGGING_STEPS` updates (500; the mean since the previous log) and the validation loss at the end of every epoch, and keeps both, at full precision, in the `trainer_state.json` saved with every checkpoint and at the end of training. The script merges those files, writes `outputs/<run>/loss_curve.tsv` with one row per logged step (step, epoch, loss, eval_loss, learning rate, gradient norm), and prints each epoch's mean training loss and validation loss. The progress job runs it too. Only the jobs that led to a saved checkpoint count, so losses from failed jobs never appear, and losses logged since a running run's newest checkpoint aren't saved yet.
 
 The training loss falls throughout. If `eval_loss` stops falling or rises while the training loss keeps falling, the model is fitting the training set more than it is learning something that carries over. The external exact match from `progress` then shows whether that matters on real spectra.
+
+**Training summary.** Every training job, however it ends, records its run in `reports/training_summary.tsv` and the run's jobs in `reports/training_jobs.tsv`. Each run gets one row: model and parameter count, dataset and split sizes, batch and learning rate, epochs and steps done, losses, quick test, and wall and GPU hours. Each job also gets a row: when it ran, on how many GPUs, the steps it resumed from and stopped at, and how it ended. Rows are named like those of `reports/evaluation_summary.tsv`. To fill in runs trained before the summary existed, or to refresh every row:
+
+    python scripts/train_summary.py --all
+
+This reads every output folder in `outputs/` and every training log in `logs/`, including the logs of the per-run scripts from before `configs/`. For those runs the settings come from what their logs printed, which `config_source` shows. `python scripts/train_summary.py <run>` records a single run.
+
+In `training_summary.tsv`, `train_loss` is the mean over the last epoch reached, and `eval_loss` and `best_eval_loss` are the last and the lowest validation loss. `config_source` is `run_config.json`, or `log` for runs from before that file existed. Only those older runs have an `input_max_length`, because later runs don't truncate inputs. In `training_jobs.tsv`, `outcome` is how the job ended:
+
+- `finished`
+- `resubmitted`: stopped before its time limit and submitted again
+- `already_finished`
+- `max_resubmits`
+- `timeout`
+- `out_of_memory`
+- `cancelled`
+- `failed`
+- `running`
+- `unknown`: the log doesn't say
+
+A job that didn't print its end time is taken to end at its log's last change. Logs from before multi-GPU training don't print a GPU count; those jobs used one GPU.
 
 ### 3. Evaluate the model on the full test set
 
@@ -493,14 +516,22 @@ Exact match on all 79,441 test molecules, from `reports/evaluation_summary.tsv`.
 
 Accuracy improves with model size, with longer inputs and with longer training. The large (10 epochs) and XXL runs have not been evaluated.
 
-Rows added by `scripts/combine_results.py` are named after the run. Older rows are named after the Slurm evaluation job. `reports/evaluation_chunks.tsv` has the score for each chunk of the older evaluations. `eval_check_5928345` in the summary is a 10-molecule smoke test and isn't comparable with the full evaluations.
+`reports/` holds the results; the raw evaluation logs stay out of Git because of their size.
+
+- **`evaluation_summary.tsv`** combines each evaluation's chunks, weighted by chunk size. `scripts/combine_results.py <run>` adds or replaces a run's row, named after the run, with the evaluation's Slurm job ID and the date.
+  - `exact_match` is top-1, and `top_2` to `top_10` are the top-n scores. They are blank for older rows and for runs with fewer outputs per spectrum.
+  - Older rows are named after the Slurm evaluation job and have no date.
+  - `eval_check_5928345` is a 10-molecule smoke test and isn't comparable with the full evaluations.
+- **`evaluation_chunks.tsv`** has the score of each chunk of the older evaluations, keyed by log file. The `eval_samll_512` log files really are spelled that way; their summary row is `eval_small_512`.
+- **`training_summary.tsv` and `training_jobs.tsv`** are described in [2. Train a model](#2-train-a-model).
+- **`dataset_stats.json`**, when present, is written by `scripts/dataset_stats.py`.
 
 ## Tests
 
     pytest tests/
 
-- `tests/test_units.py` checks the evaluation bookkeeping (resume, chunk tiling, summary rows), the loss history, how run, fine-tuning and predict configs are loaded, which checkpoints `SAVE_STRATEGY=epoch` keeps, and the training setup in about a minute. One test trains a tiny model under FSDP on two CPU processes, saves a sharded checkpoint, and checks that `checkpoint_progress.py` loads exactly those weights.
-- `tests/test_smoke.py` trains `google/flan-t5-small` for 3 steps on CPU on a tiny synthetic dataset. It then evaluates, resumes an interrupted evaluation, combines the chunks, and scores the checkpoints with `checkpoint_progress.py`, on its own validation set and on all of a second, external dataset, including resuming an interrupted scoring, sharing the checkpoints between two tasks and top-2 beam search. It also writes the loss curve with `loss_curve.py`, runs the steps of `./submit.sh predict` on a folder that holds only the test split, and fine-tunes the trained model on a second dataset for two epochs, keeping both epoch checkpoints, and scores them after the model it started from. It downloads the model on first use and takes a few minutes.
+- `tests/test_units.py` checks the evaluation bookkeeping (resume, chunk tiling, summary rows), the training summary (current and old training logs, how jobs ended, the `--all` backfill), the loss history, how run, fine-tuning and predict configs are loaded, which checkpoints `SAVE_STRATEGY=epoch` keeps, and the training setup in about a minute. One test trains a tiny model under FSDP on two CPU processes, saves a sharded checkpoint, and checks that `checkpoint_progress.py` loads exactly those weights.
+- `tests/test_smoke.py` trains `google/flan-t5-small` for 3 steps on CPU on a tiny synthetic dataset. It then evaluates, resumes an interrupted evaluation, combines the chunks, and scores the checkpoints with `checkpoint_progress.py`, on its own validation set and on all of a second, external dataset, including resuming an interrupted scoring, sharing the checkpoints between two tasks and top-2 beam search. It also writes the loss curve with `loss_curve.py`, records the run in a training summary, runs the steps of `./submit.sh predict` on a folder that holds only the test split, and fine-tunes the trained model on a second dataset for two epochs, keeping both epoch checkpoints, and scores them after the model it started from. It downloads the model on first use and takes a few minutes.
 
 GitHub Actions runs both on every push (`.github/workflows/smoke.yml`). `python tests/make_tiny_dataset.py` writes the tiny dataset to `tmp/tiny/` for trying things by hand.
 
@@ -527,12 +558,13 @@ GitHub Actions runs both on every push (`.github/workflows/smoke.yml`). `python 
     scripts/dataset_stats.py     token-length and tokenizer statistics
     scripts/check_target_lengths.py  SMILES longer than the token limits
     scripts/scaling_table.py     throughput and scaling efficiency across node counts
+    scripts/train_summary.py     records training runs and their jobs in reports/
     tests/                       unit and smoke tests
     requirements.txt             packages the code uses
     environment.yml              Conda environment
     environment.lock.txt         exact package list on Isambard-AI
     data/                        dataset manifest and checksums
-    reports/                     evaluation results
+    reports/                     evaluation results and training summary
 
 These folders are created locally and aren't stored in Git: `outputs/` (models and checkpoints) and `logs/` (Slurm logs). The datasets live outside the repository. `nmr_expt_data` is a second dataset listed in `data/manifest.tsv`, in `/projects/b5an/nmr_expt_data`; to train on it, set `DATA_DIR` to that folder in a run's config, and to test a model trained on another dataset on it, give `EVAL_DATA_DIR` (see [External test set](#3-evaluate-the-model-on-the-full-test-set)).
 

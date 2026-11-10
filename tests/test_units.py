@@ -761,3 +761,258 @@ def test_progress_finds_the_model_a_finetune_started_from(tmp_path):
     (model / "config.json").write_text("{}")
     (model / "model.safetensors").write_text("")
     assert start_model(run) == model
+
+
+CURRENT_LOG = """\
+===== Slurm Job Info =====
+Run: xl_pg4_10ep (configs/train/xl_pg4_10ep.env)
+Job ID: 7100001
+Nodes: nid[001001-001002] (2)
+GPUs per node: 4
+Global batch: 32
+Start time: Tue Sep 29 18:00:00 BST 2026
+Resubmission: 1 of 20
+Output directory: outputs/xl_pg4_10ep_gb32
+===== Start Training =====
+===== Experiment Configuration =====
+PyTorch: 2.12.1
+GPU 0: NVIDIA GH200 120GB
+bf16: True
+model_name: google/flan-t5-xl
+data_dir: /projects/b5an/alberts_2d
+train_batch_size: 4
+grad_accumulation_steps: 1
+gradient_checkpointing: False
+finetune_model_path: None
+world_size: 8
+====================================
+Train rows: 679213
+Validation rows used for eval_loss: 5000
+Resuming from checkpoint: outputs/xl_pg4_10ep_gb32/checkpoint-4000
+{'loss': '0.1', 'epoch': '0.5'}
+ 10%|#         | 4100/42450\r 11%|#         | 4200/42450
+Stopped before the job time limit at step 6000 - checkpoint saved; submit again to continue.
+===== Resubmitting to continue from the last checkpoint =====
+Submitted batch job 7100002
+End time: Wed 30 Sep 17:30:00 BST 2026
+"""
+
+# As the per-run scripts from before configs/ wrote it.
+OLD_LOG = """\
+===== Slurm Job Info =====
+Job ID: 5941000
+Job name: flan_t5_xl_4x4_10ep
+Node: nid001003
+Start time: Mon Sep  7 09:00:00 BST 2026
+===== Shell Training Configuration =====
+Model: google/flan-t5-xl
+Input max length: 1536
+Train batch size per device: 4
+Gradient accumulation steps: 4
+Gradient checkpointing: 1
+Output directory: /home/b5an/t5_nmr/outputs/flan-t5-xl_nmr_input1536_4x4_ep10
+===== Start Training =====
+===== Experiment Configuration =====
+Data directory: /projects/b5an/alberts_2d
+Train rows: 679213
+Validation rows: 35749
+Test rows: 79441
+Target max length: 128
+Learning rate: 5e-05
+Epochs: 10
+Random seed: 42
+Final model saved to: /home/b5an/t5_nmr/outputs/flan-t5-xl_nmr_input1536_4x4_ep10/final_model
+===== Job Finished Successfully =====
+End time: Mon Sep  7 21:00:00 BST 2026
+"""
+
+
+def write_log(folder: Path, name: str, text: str) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    path.write_text(text)
+    return path
+
+
+def test_current_training_log_read(tmp_path):
+    from train_summary import log_output_key, parse_log
+
+    path = write_log(tmp_path, "train_xl_pg4_10ep_7100001.out", CURRENT_LOG)
+    assert log_output_key(path) == "outputs/xl_pg4_10ep_gb32"
+    job = parse_log(path)
+    assert job["job_id"] == "7100001"
+    assert (job["nodes"], job["gpus_per_node"], job["resubmission"]) == (2, 4, 1)
+    assert job["gpu_name"] == "NVIDIA GH200 120GB"
+    assert (job["resumed_from_step"], job["stopped_at_step"]) == (4000, 6000)
+    assert job["outcome"] == "resubmitted"
+    assert (job["end"] - job["start"]).total_seconds() == 23.5 * 3600
+    assert job["settings"] == {
+        "model_name": "google/flan-t5-xl",
+        "data_dir": "/projects/b5an/alberts_2d",
+        "train_batch_size": 4,
+        "grad_accumulation_steps": 1,
+        "gradient_checkpointing": False,
+        "finetune_model_path": None,
+        "world_size": 8,
+    }
+    # The validation rows used for eval_loss are not the split's.
+    assert job["split_rows"] == {"train": 679213}
+
+
+def test_old_training_log_read(tmp_path):
+    from train_summary import log_output_key, parse_log
+
+    path = write_log(tmp_path, "flan_t5_xl_4x4_10ep_5941000.out", OLD_LOG)
+    # Printed absolute, from wherever the repository was then.
+    assert log_output_key(path) == "outputs/flan-t5-xl_nmr_input1536_4x4_ep10"
+    job = parse_log(path)
+    assert job["outcome"] == "finished"
+    assert job["settings"]["input_max_length"] == 1536
+    assert job["settings"]["target_max_length"] == 128
+    assert job["settings"]["learning_rate"] == 5e-5
+    assert job["settings"]["gradient_checkpointing"] == 1
+    assert job["split_rows"] == {"train": 679213, "validation": 35749, "test": 79441}
+
+
+def test_other_logs_are_not_training_logs(tmp_path):
+    from train_summary import log_output_key
+
+    path = write_log(tmp_path, "eval_xl_1.out", "Run: xl\nOutput: outputs/xl/test_0_10_results.json\n")
+    assert log_output_key(path) is None
+
+
+@pytest.mark.parametrize(
+    "tail, outcome",
+    [
+        ("slurmstepd: error: *** JOB 1 ON nid001 CANCELLED AT 2026-10-01T10:00:00 DUE TO TIME LIMIT ***", "timeout"),
+        ("slurmstepd: error: *** JOB 1 ON nid001 CANCELLED AT 2026-10-01T10:00:00 ***", "cancelled"),
+        ("Traceback (most recent call last):\ntorch.OutOfMemoryError: CUDA out of memory.", "out_of_memory"),
+        ("Traceback (most recent call last):\nValueError: bad", "failed"),
+        ("Stopped before the job time limit at step 6\n===== Not finished, but MAX_RESUBMITS=20 reached =====", "max_resubmits"),
+        ("Training already finished: outputs/x/final_model\n===== Training finished =====", "already_finished"),
+        # A traceback printed along the way doesn't undo a clean finish.
+        ("Traceback (most recent call last):\nUserWarning\n===== Training finished =====", "finished"),
+    ],
+)
+def test_how_a_training_job_ended(tmp_path, tail, outcome):
+    from train_summary import parse_log
+
+    path = write_log(tmp_path, "train_x_1.out", "Job ID: 1\n===== Start Training =====\n" + tail + "\n")
+    assert parse_log(path)["outcome"] == outcome
+
+
+def test_job_without_an_ending_is_failed_only_when_it_records_itself(tmp_path, monkeypatch):
+    from train_summary import job_outcome, parse_log
+
+    monkeypatch.setattr("train_summary.still_queued", lambda job_id: None)
+    job = parse_log(write_log(tmp_path, "train_x_1.out", "Job ID: 1\n===== Start Training =====\n"))
+    assert job["outcome"] is None
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    assert job_outcome(job) == "unknown"
+    # train.sbatch records the run on its way out, so it is its own last job.
+    monkeypatch.setenv("SLURM_JOB_ID", "1")
+    assert job_outcome(job) == "failed"
+
+
+def test_training_rows_named_like_evaluation_rows():
+    from train_summary import configured_runs, experiment_name, folder_key
+
+    assert experiment_name("xl_pg4_10ep", Path("outputs/xl_pg4_10ep_gb32")) == "xl_pg4_10ep_gb32"
+    assert experiment_name("xl_4x4_10ep", Path("outputs/flan-t5-xl_nmr_input1536_4x4_ep10")) == "xl_4x4_10ep"
+    runs = configured_runs()
+    assert runs[folder_key("outputs/flan-t5-xl_nmr_input1536_4x4_ep10")] == "xl_4x4_10ep"
+    assert runs["outputs/xl_4x1x4_10ep"] == "xl_4x1x4_10ep"
+
+
+def test_record_rows_replaces_every_row_of_the_experiment(tmp_path):
+    from combine_results import record_rows
+
+    jobs = tmp_path / "jobs.tsv"
+    columns = ["experiment", "job_id"]
+    record_rows(jobs, "a", [{"experiment": "a", "job_id": "1"}, {"experiment": "a", "job_id": "2"}], columns)
+    record_rows(jobs, "b", [{"experiment": "b", "job_id": "3"}], columns)
+    record_rows(jobs, "a", [{"experiment": "a", "job_id": "4"}], columns)
+    lines = jobs.read_text().splitlines()
+    assert lines == ["experiment\tjob_id", "b\t3", "a\t4"]
+
+
+def test_backfill_records_every_run_found(tmp_path, monkeypatch):
+    import csv
+
+    import train_summary
+
+    outputs, logs, data = tmp_path / "outputs", tmp_path / "logs", tmp_path / "data"
+    for split, rows in (("train", 5), ("val", 2), ("test", 3)):
+        write_log(data, f"tgt-{split}.txt", "C\n" * rows)
+
+    # A legacy run: finished, with only its old log to say how it was set up.
+    legacy = outputs / "flan-t5-xl_nmr_input1536_4x4_ep10"
+    (legacy / "final_model").mkdir(parents=True)
+    (legacy / "final_model" / "config.json").write_text("{}")
+    (legacy / "final_model" / "model.safetensors").write_text("")
+    history = [
+        {"step": 10, "epoch": 0.5, "loss": 2.0},
+        {"step": 20, "epoch": 1.0, "loss": 1.0},
+        {"step": 20, "epoch": 1.0, "eval_loss": 0.8},
+        {"step": 30, "epoch": 1.5, "loss": 0.6},
+        {"step": 40, "epoch": 2.0, "loss": 0.4},
+        {"step": 40, "epoch": 2.0, "eval_loss": 0.9},
+    ]
+    (legacy / "trainer_state.json").write_text(json.dumps({
+        "global_step": 40, "max_steps": 40, "epoch": 2.0, "num_train_epochs": 2,
+        "train_batch_size": 4, "log_history": history,
+    }))
+    write_log(logs, "flan_t5_xl_4x4_10ep_5941000.out", OLD_LOG)
+    # A run with no logs left.
+    orphan = outputs / "orphan_run"
+    orphan.mkdir()
+    (orphan / "run_config.json").write_text(json.dumps({
+        "data_dir": str(data), "world_size": 4, "gpus_per_node": 4, "train_batch_size": 2,
+        "grad_accumulation_steps": 2, "global_batch_size": 16, "num_epochs": 10.0,
+        "learning_rate": 5e-5, "effective_learning_rate": 5e-5,
+    }))
+    # A log whose output folder has been deleted, and a log that isn't training.
+    write_log(logs, "train_gone_7.out", CURRENT_LOG.replace("xl_pg4_10ep_gb32", "gone_run"))
+    write_log(logs, "eval_x_8.out", "Run: x\n")
+    # A row recorded earlier for a run whose files are all gone is kept.
+    summary, jobs = tmp_path / "summary.tsv", tmp_path / "jobs.tsv"
+    summary.write_text("experiment\tstatus\nearlier_run\tcomplete\n")
+
+    monkeypatch.setattr("train_summary.still_queued", lambda job_id: None)
+    monkeypatch.setattr(sys, "argv", [
+        "train_summary.py", "--all", "--logs-dir", str(logs), "--outputs-dir", str(outputs),
+        "--summary", str(summary), "--jobs", str(jobs),
+    ])
+    train_summary.main()
+
+    with summary.open(newline="") as file:
+        rows = {row["experiment"]: row for row in csv.DictReader(file, delimiter="\t")}
+    assert set(rows) == {"earlier_run", "xl_4x4_10ep", "orphan_run", "gone_run"}
+
+    row = rows["xl_4x4_10ep"]
+    assert row["status"] == "complete"
+    assert row["last_outcome"] == "finished"
+    assert row["config_source"] == "log"
+    assert (row["input_max_length"], row["target_max_length"]) == ("1536", "128")
+    assert (row["train_rows"], row["test_rows"]) == ("679213", "79441")
+    assert (row["epochs"], row["epochs_done"], row["steps_done"]) == ("10", "2", "40")
+    assert (row["gpus"], row["global_batch"], row["gradient_checkpointing"]) == ("1", "16", "1")
+    assert (row["train_loss"], row["eval_loss"]) == ("0.5000", "0.9000")
+    assert (row["best_eval_loss"], row["best_eval_epoch"]) == ("0.8000", "1")
+    assert (row["wall_hours"], row["gpu_hours"], row["job_ids"]) == ("12.00", "12.00", "5941000")
+
+    row = rows["orphan_run"]
+    assert (row["status"], row["config_source"], row["jobs"]) == ("incomplete", "run_config.json", "0")
+    assert (row["dataset"], row["train_rows"], row["validation_rows"], row["test_rows"]) == ("data", "5", "2", "3")
+    assert (row["nodes"], row["gpus"], row["global_batch"]) == ("1", "4", "16")
+
+    row = rows["gone_run"]
+    assert (row["status"], row["last_outcome"], row["nodes"], row["gpus"]) == ("missing", "resubmitted", "2", "8")
+
+    with jobs.open(newline="") as file:
+        job_rows = list(csv.DictReader(file, delimiter="\t"))
+    assert [(job["experiment"], job["job_id"], job["outcome"]) for job in job_rows] == [
+        ("xl_4x4_10ep", "5941000", "finished"),
+        ("gone_run", "7100001", "resubmitted"),
+    ]
+    assert job_rows[1]["gpu_hours"] == "188.00"

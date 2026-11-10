@@ -182,25 +182,35 @@ def combine_predictions(chunks: list[dict], destination: Path) -> None:
             output.writelines(lines)
 
 
-def record_summary(summary: Path, row: dict) -> None:
+def record_rows(path: Path, experiment: str, new_rows: list[dict], columns: list[str]) -> None:
+    """Replace every row of experiment in the TSV at path with new_rows.
+
+    Other experiments' rows are kept. Columns not in columns, from new or
+    existing rows, are kept after them.
+    """
     rows = []
-    if summary.is_file():
-        with summary.open(newline="") as file:
+    if path.is_file():
+        with path.open(newline="") as file:
             rows = list(csv.DictReader(file, delimiter="\t"))
-    # Evaluating a run again replaces its row.
-    rows = [existing for existing in rows if existing["experiment"] != row["experiment"]]
-    rows.append(row)
-    # Runs with more than 10 outputs add top_11 and beyond at the end.
-    columns = list(SUMMARY_COLUMNS)
+    rows = [existing for existing in rows if existing["experiment"] != experiment]
+    rows += new_rows
+    columns = list(columns)
     for existing in rows:
         columns += [name for name in existing if name not in columns]
-    with summary.open("w", newline="") as file:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as file:
         writer = csv.DictWriter(
             file, fieldnames=columns, delimiter="\t", restval="",
             lineterminator="\n",
         )
         writer.writeheader()
         writer.writerows(rows)
+
+
+def record_summary(summary: Path, row: dict) -> None:
+    # Evaluating a run again replaces its row. Runs with more than 10
+    # outputs add top_11 and beyond at the end.
+    record_rows(summary, row["experiment"], [row], SUMMARY_COLUMNS)
 
 
 def main() -> None:
